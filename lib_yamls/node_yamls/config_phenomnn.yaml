@@ -1,0 +1,34 @@
+default:
+  embedding_hidden: 128
+  MLP_hidden: 128
+  epochs: 100
+  dropout: 0.5
+  lr: 1.0e-3 
+  wd: 0.0
+
+  lam0: 10
+  lam1: 10
+  alpha: 0.1 
+  prop_step: 16 
+  normalization: "ln"
+  encoder_num_layers: 1
+  decoder_hidden: 128
+  decoder_num_layers: 1
+
+cora:
+  embedding_hidden: 128
+  MLP_hidden: 64
+  epochs: 50
+  dropout: 0.5
+  lr: 1.0e-2 
+  wd: 0.00001
+
+  lam0: 10
+  lam1: 10
+  alpha: 0.5 
+  prop_step: 16 
+  normalization: "ln"
+  encoder_num_layers: 1
+  decoder_hidden: 128
+  decoder_num_layers: 1
+

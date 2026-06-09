@@ -1,0 +1,27 @@
+default:
+  All_num_layers: 1
+  embedding_hidden: 256
+  MLP_hidden: 256
+  epochs: 200
+  dropout: 0.5
+  lr: 1.0e-2
+  wd: 0
+
+  HNHN_alpha: -1.5
+  HNHN_beta: -0.5
+  HNHN_nonlinear_inbetween: true
+
+RHG_10:
+  All_num_layers: 1
+  embedding_hidden: 128
+  MLP_hidden: 64
+  epochs: 200
+  dropout: 0.2
+  lr: 1.0e-2
+  wd: 0
+  pooling: "max"
+  early_stop: true
+
+  HNHN_alpha: -1.5
+  HNHN_beta: -0.5
+  HNHN_nonlinear_inbetween: true

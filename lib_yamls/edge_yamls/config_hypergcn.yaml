@@ -1,0 +1,24 @@
+default:
+  All_num_layers: 2
+  embedding_hidden: 128
+  MLP_hidden: 64
+  epochs: 500
+  dropout: 0.2
+  lr: 1.0e-3
+  wd: 0
+
+  HyperGCN_mediators: true
+  HyperGCN_fast: true 
+
+cora:
+  All_num_layers: 2
+  embedding_hidden: 128
+  MLP_hidden: 64
+  epochs: 150
+  dropout: 0.5
+  lr: 1.0e-3
+  wd: 0
+
+  HyperGCN_mediators: true 
+  HyperGCN_fast: true 
+

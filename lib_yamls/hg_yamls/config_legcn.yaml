@@ -1,0 +1,20 @@
+default:
+  All_num_layers: 2
+  embedding_hidden: 256
+  MLP_hidden: 256
+  epochs: 200
+  dropout: 0.5
+  lr: 1.0e-2
+  wd: 0
+
+RHG_10:
+  All_num_layers: 1
+  embedding_hidden: 128
+  MLP_hidden: 64
+  epochs: 200
+  dropout: 0.2
+  lr: 1.0e-2 
+  wd: 0
+  pooling: "mean"
+  early_stop: true
+

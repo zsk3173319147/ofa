@@ -1,0 +1,18 @@
+default:
+  All_num_layers: 2
+  embedding_hidden: 256
+  MLP_hidden: 256
+  epochs: 200
+  dropout: 0.5
+  lr: 1.0e-2
+  wd: 0
+
+cora:
+  All_num_layers: 2
+  embedding_hidden: 128
+  MLP_hidden: 256
+  epochs: 100
+  dropout: 0.1
+  lr: 1.0e-2
+  wd: 0.01
+

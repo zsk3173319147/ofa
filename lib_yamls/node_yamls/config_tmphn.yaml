@@ -1,0 +1,31 @@
+default:
+  All_num_layers: 1 
+  embedding_hidden: 128
+  MLP_hidden: 128
+  epochs: 100
+  dropout: 0.5
+  lr: 1.0e-3
+  wd: 0.0
+
+  hyperG_norm: false # whether normalize hypergraph adjacency tensor\
+  hid_dim: 128
+  M: 5 # the maximum cardinality of the hypergraph
+  Mlst: #'the maximum cardinality of the hypergraph at each layer, max(Mlst) = M'
+    - 3 
+  combine: "concat" # 'the combine operation in T-MPHN (e.g., concat, sum))'
+
+cora:
+  All_num_layers: 1 
+  embedding_hidden: 128
+  MLP_hidden: 128
+  epochs: 20
+  dropout: 0.5
+  lr: 1.0e-2 
+  wd: 0.0
+
+  hyperG_norm: false # whether normalize hypergraph adjacency tensor\
+  hid_dim: 128
+  M: 5 # the maximum cardinality of the hypergraph
+  Mlst: 
+    - 5 #'the maximum cardinality of the hypergraph at each layer, max(Mlst) = M' 
+  combine: "concat" # 'the combine operation in T-MPHN (e.g., concat, sum))'

@@ -1,0 +1,539 @@
+from __future__ import annotations
+
+import copy
+import os
+import time
+from collections import defaultdict
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from sklearn.metrics import accuracy_score, average_precision_score, f1_score, roc_auc_score
+from tqdm import tqdm
+
+from lib_dataset.edge_loaders import generate_edge_loaders, generate_ind_split_hyperedges, generate_split_hyperedges
+from lib_dataset.hg_loaders import generate_hg_loaders, generate_split_hypergraphs
+from lib_models.HNN.preprocessing import algo_preprocessing
+from lib_utils.exp_agent import build_edge_prediction_graph, parse_model
+from lib_utils.metrics import avg_result_printer_edge, edge_evaluation_printer, hg_evaluation_printer
+from lib_utils.train_agent import (
+    freeze_encoder_if_linear_probe,
+    keep_encoder_eval_if_linear_probe,
+    load_pretrained_encoder_if_requested,
+    trainable_parameters,
+)
+from lib_utils.unified_model import UnifiedDownstreamModel
+from lib_utils.utils import add_self_loop_hyperedges, fix_seed, mean_std_metrics, relabel_hyperedge_index, result_printer
+from tasker import (
+    GraphClsTaskAdapter,
+    HyperedgeQuery,
+    NodeClsSubgraphTaskAdapter,
+    NodeClsTaskAdapter,
+    PropagationSubgraphBuilder,
+    TaskBatch,
+    TaskType,
+    append_graph_batch_role_features,
+    build_edge_subgraph_task_batch,
+    is_subgraph_mode,
+    model_data_with_subgraph_schema,
+)
+
+
+def _node_batch_size(args) -> int | None:
+    value = getattr(args, "unified_node_batch_size", None)
+    return int(value) if value else None
+
+
+def _prepare_hg_batch(batch, args):
+    if args.method in ["HyperND", "TFHNN", "HyperGCN", "SheafHyperGNN"]:
+        reindex_hyperedge_index, _ = relabel_hyperedge_index(batch.hyperedge_index)
+        batch.hyperedge_index = reindex_hyperedge_index
+        batch.edge_index = reindex_hyperedge_index
+        batch.hyperedge_index = add_self_loop_hyperedges(batch.hyperedge_index, batch.num_nodes)
+        batch.edge_index = batch.hyperedge_index
+
+    batch = algo_preprocessing(batch, args)
+
+    if args.method in ["AllSetformer"]:
+        batch.norm = torch.ones_like(batch.hyperedge_index[0])
+
+    return batch
+
+
+def _new_optimizer(model, args):
+    if is_subgraph_mode(args):
+        base_lr = float(getattr(args, "subgraph_lr", None) or args.lr)
+        base_wd = float(getattr(args, "subgraph_wd", None) if getattr(args, "subgraph_wd", None) is not None else args.wd)
+        encoder_lr = base_lr * float(getattr(args, "subgraph_encoder_lr_scale", 1.0))
+        head_lr = base_lr * float(getattr(args, "subgraph_head_lr_scale", 1.0))
+
+        encoder_params = []
+        head_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name.startswith("encoder."):
+                encoder_params.append(param)
+            else:
+                head_params.append(param)
+
+        param_groups = []
+        if encoder_params:
+            param_groups.append({"params": encoder_params, "lr": encoder_lr, "weight_decay": base_wd})
+        if head_params:
+            param_groups.append({"params": head_params, "lr": head_lr, "weight_decay": base_wd})
+        return torch.optim.Adam(param_groups, lr=base_lr, weight_decay=base_wd)
+
+    return torch.optim.Adam(trainable_parameters(model), lr=args.lr, weight_decay=args.wd)
+
+
+class UnifiedExpAgent:
+    """Downstream-only unified path based on TaskBatch and target-aware readout."""
+
+    def __init__(self, args):
+        self.args = args
+        self.device = args.device
+        self.train_times = []
+        self.test_dict = defaultdict(list)
+        self._subgraph_builders = {}
+
+    def _build_model(self, data, task_type: TaskType, num_targets: int):
+        self.args.embedding_mode = True
+        model_data = model_data_with_subgraph_schema(data, self.args) if is_subgraph_mode(self.args) else data
+        encoder = parse_model(self.args, model_data)
+        model = UnifiedDownstreamModel(encoder, task_type, num_targets, self.args)
+        if self.args.method != "TMPHN":
+            model = model.to(self.device)
+        return model
+
+    def _reset_and_prepare_model(self, model):
+        model.reset_parameters()
+        load_pretrained_encoder_if_requested(model, self.args)
+        freeze_encoder_if_linear_probe(model, self.args)
+        return _new_optimizer(model, self.args)
+
+    def _label_smoothing(self) -> float:
+        if not is_subgraph_mode(self.args):
+            return 0.0
+        return max(float(getattr(self.args, "subgraph_label_smoothing", 0.0)), 0.0)
+
+    def _use_best_model(self) -> bool:
+        return bool(getattr(self.args, "early_stop", False)) or (
+            is_subgraph_mode(self.args) and bool(getattr(self.args, "subgraph_use_best_model", True))
+        )
+
+    def _train_node_epoch(self, model, adapter, optimizer):
+        model.train()
+        keep_encoder_eval_if_linear_probe(model, self.args)
+        total_loss = 0.0
+        steps = 0
+
+        for batch in adapter:
+            batch = self._prepare_unified_batch(batch)
+            optimizer.zero_grad()
+            logits = model(batch)
+            loss = F.cross_entropy(logits, batch.y.long(), label_smoothing=self._label_smoothing())
+            loss.backward()
+            if self.args.clip_grad:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.clip_thresh)
+            optimizer.step()
+            total_loss += float(loss.item())
+            steps += 1
+
+        return total_loss / max(steps, 1)
+
+    def _prepare_unified_batch(self, batch: TaskBatch) -> TaskBatch:
+        if is_subgraph_mode(self.args):
+            batch.h_prime = _prepare_hg_batch(batch.h_prime, self.args)
+        return batch.to(self.device)
+
+    def _node_adapter(self, data, masks, split: str, shuffle: bool):
+        if is_subgraph_mode(self.args):
+            return NodeClsSubgraphTaskAdapter(
+                data,
+                masks,
+                self.args,
+                split=split,
+                batch_size=getattr(self.args, "subgraph_batch_size", 128),
+                shuffle=shuffle,
+            )
+        return NodeClsTaskAdapter(
+            data,
+            masks,
+            split=split,
+            batch_size=_node_batch_size(self.args),
+            shuffle=shuffle,
+        )
+
+    def _subgraph_builder(self, data) -> PropagationSubgraphBuilder:
+        key = id(data)
+        builder = self._subgraph_builders.get(key)
+        if builder is None:
+            builder = PropagationSubgraphBuilder(data, self.args)
+            self._subgraph_builders[key] = builder
+        return builder
+
+    @torch.no_grad()
+    def _eval_node_split(self, model, data, masks, split: str):
+        model.eval()
+        adapter = self._node_adapter(data, masks, split=split, shuffle=False)
+        preds = []
+        labels = []
+        for batch in adapter:
+            batch = self._prepare_unified_batch(batch)
+            logits = model(batch)
+            preds.append(logits.argmax(dim=-1).detach().cpu())
+            labels.append(batch.y.detach().cpu())
+
+        if not preds:
+            return 0.0
+        pred = torch.cat(preds).numpy()
+        label = torch.cat(labels).numpy()
+        return accuracy_score(label, pred) * 100.0
+
+    @torch.no_grad()
+    def _eval_node(self, model, data, masks):
+        return [
+            self._eval_node_split(model, data, masks, "train"),
+            self._eval_node_split(model, data, masks, "valid"),
+            self._eval_node_split(model, data, masks, "test"),
+        ]
+
+    def node_cls_train_eval(self, data):
+        metrics_dict = defaultdict(list)
+
+        for seed in range(self.args.num_seeds):
+            fix_seed(seed)
+            masks = data.generate_random_split(
+                train_ratio=self.args.train_prop,
+                val_ratio=self.args.valid_prop,
+                seed=seed,
+            )
+
+            model = self._build_model(data, TaskType.NODE_CLS, data.num_classes)
+            optimizer = self._reset_and_prepare_model(model)
+            train_adapter = self._node_adapter(data, masks, split="train", shuffle=True)
+
+            start_time = time.time()
+            best_score = -1.0
+            best_model = None
+
+            for epoch in tqdm(range(self.args.epochs)):
+                loss = self._train_node_epoch(model, train_adapter, optimizer)
+
+                if (epoch + 1) % self.args.display_step == 0:
+                    result = self._eval_node(model, data, masks)
+                    if result[1] >= best_score:
+                        best_score = result[1]
+                        best_model = copy.deepcopy(model)
+                    print(f"Epoch: {epoch + 1:02d}, Training loss: {loss:.4f}, Valid acc: {result[1]:.4f}")
+
+            train_time = time.time() - start_time
+            self.train_times.append(train_time)
+            print(f"Training Time: {train_time:.2f}")
+
+            eval_model = best_model if self._use_best_model() and best_model is not None else model
+            result = self._eval_node(eval_model, data, masks)
+            if eval_model is best_model:
+                print(f"Using best validation model with score: {best_score:.4f}")
+            print(f"------------------------------[Seed {seed}]-----------------------------------")
+            print(f"train_acc: {result[0]:.2f}, valid_acc: {result[1]:.2f}, test_acc: {result[2]:.2f}")
+            print(f"------------------------------------------------------------------------------")
+            metrics_dict["acc"].append(result)
+
+        print(f"---------------------------------[Final]--------------------------------------")
+        for metric_name, values in metrics_dict.items():
+            result_printer(values, metric_name)
+            metrics_mean, metrics_std = mean_std_metrics(values)
+            self.test_dict[metric_name].extend([metrics_mean[-1], metrics_std[-1]])
+        print(f"Avg Training Time: {np.mean(self.train_times):2f}")
+        print(f"------------------------------------------------------------------------------")
+
+    def _edge_split_file(self, seed: int) -> str:
+        return os.path.join(self.args.edge_save_dir, self.args.edge_split_mode, self.args.dname, f"split_{seed}.pt")
+
+    def _ensure_edge_split(self, data, seed: int):
+        split_file = self._edge_split_file(seed)
+        if os.path.exists(split_file):
+            return
+        os.makedirs(os.path.dirname(split_file), exist_ok=True)
+        if self.args.edge_split_mode == "ind":
+            generate_ind_split_hyperedges(data, self.args, seed)
+        elif self.args.edge_split_mode == "trand":
+            generate_split_hyperedges(data, self.args, seed)
+        else:
+            raise NotImplementedError
+
+    def _edge_task_batch(self, data, hyperedges, labels):
+        if is_subgraph_mode(self.args):
+            builder = self._subgraph_builder(data)
+            batch = build_edge_subgraph_task_batch(builder, hyperedges, labels)
+            batch.h_prime = _prepare_hg_batch(batch.h_prime, self.args)
+            return batch.to(self.device)
+
+        return TaskBatch(
+            h_prime=data,
+            query=HyperedgeQuery(hyperedges),
+            task_type=TaskType.EDGE_PRED,
+            y=labels,
+            split="edge_pred",
+        ).to(self.device)
+
+    def _train_edge_epoch(self, model, data, batch_loaders, optimizer):
+        model.train()
+        keep_encoder_eval_if_linear_probe(model, self.args)
+        total_loss = 0.0
+        steps = 0
+
+        pos_loader = batch_loaders["train_pos"]
+        neg_loader = batch_loaders["train_neg"]
+        while True:
+            pos_hyperedges, pos_labels, pos_last = pos_loader.next()
+            neg_hyperedges, neg_labels, neg_last = neg_loader.next()
+            hyperedges = list(pos_hyperedges) + list(neg_hyperedges)
+            labels = torch.cat([pos_labels, neg_labels], dim=0)
+            batch = self._edge_task_batch(data, hyperedges, labels)
+
+            optimizer.zero_grad()
+            logits = model(batch)
+            targets = batch.y.float()
+            if is_subgraph_mode(self.args):
+                eps = min(self._label_smoothing(), 0.49)
+                targets = targets * (1.0 - 2.0 * eps) + eps
+            loss = F.binary_cross_entropy_with_logits(logits, targets)
+            loss.backward()
+            if self.args.clip_grad:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.clip_thresh)
+            optimizer.step()
+
+            total_loss += float(loss.item())
+            steps += 1
+            if pos_last or neg_last:
+                break
+
+        return total_loss / max(steps, 1)
+
+    @torch.no_grad()
+    def _edge_loader_scores(self, model, data, dataloader):
+        model.eval()
+        preds = []
+        labels = []
+
+        while True:
+            hyperedges, batch_labels, is_last = dataloader.next()
+            batch = self._edge_task_batch(data, hyperedges, batch_labels)
+            logits = model(batch)
+            preds.append(torch.sigmoid(logits).detach().cpu())
+            labels.append(batch.y.detach().cpu())
+            if is_last:
+                break
+
+        return torch.cat(preds).tolist(), torch.cat(labels).tolist()
+
+    def _eval_edge_train(self, model, data, batch_loaders):
+        pred_pos, label_pos = self._edge_loader_scores(model, data, batch_loaders["train_pos"])
+        pred_neg, label_neg = self._edge_loader_scores(model, data, batch_loaders["train_neg"])
+
+        return {
+            "roc_train": roc_auc_score(np.array(label_pos + label_neg), np.array(pred_pos + pred_neg)),
+            "ap_train": average_precision_score(np.array(label_pos + label_neg), np.array(pred_pos + pred_neg)),
+        }
+
+    def _eval_edge_val_test(self, model, data, batch_loaders, mode: str):
+        pred_pos, label_pos = self._edge_loader_scores(model, data, batch_loaders[f"{mode}_pos"])
+        pred_sns, label_sns = self._edge_loader_scores(model, data, batch_loaders[f"{mode}_neg_sns"])
+        pred_mns, label_mns = self._edge_loader_scores(model, data, batch_loaders[f"{mode}_neg_mns"])
+        pred_cns, label_cns = self._edge_loader_scores(model, data, batch_loaders[f"{mode}_neg_cns"])
+
+        roc_sns = roc_auc_score(np.array(label_pos + label_sns), np.array(pred_pos + pred_sns))
+        ap_sns = average_precision_score(np.array(label_pos + label_sns), np.array(pred_pos + pred_sns))
+        roc_mns = roc_auc_score(np.array(label_pos + label_mns), np.array(pred_pos + pred_mns))
+        ap_mns = average_precision_score(np.array(label_pos + label_mns), np.array(pred_pos + pred_mns))
+        roc_cns = roc_auc_score(np.array(label_pos + label_cns), np.array(pred_pos + pred_cns))
+        ap_cns = average_precision_score(np.array(label_pos + label_cns), np.array(pred_pos + pred_cns))
+
+        d = len(pred_pos) // 3
+        label_mixed = label_pos + label_sns[:d] + label_mns[:d] + label_cns[:d]
+        pred_mixed = pred_pos + pred_sns[:d] + pred_mns[:d] + pred_cns[:d]
+        roc_mixed = roc_auc_score(np.array(label_mixed), np.array(pred_mixed))
+        ap_mixed = average_precision_score(np.array(label_mixed), np.array(pred_mixed))
+
+        return {
+            "roc_sns": roc_sns,
+            "ap_sns": ap_sns,
+            "roc_mns": roc_mns,
+            "ap_mns": ap_mns,
+            "roc_cns": roc_cns,
+            "ap_cns": ap_cns,
+            "roc_mixed": roc_mixed,
+            "ap_mixed": ap_mixed,
+            "roc_average": (roc_sns + roc_mns + roc_cns + roc_mixed) / 4,
+            "ap_average": (ap_sns + ap_mns + ap_cns + ap_mixed) / 4,
+        }
+
+    def _eval_edge(self, model, data, batch_loaders):
+        return (
+            self._eval_edge_train(model, data, batch_loaders),
+            self._eval_edge_val_test(model, data, batch_loaders, "val"),
+            self._eval_edge_val_test(model, data, batch_loaders, "test"),
+        )
+
+    def edge_pred_train_eval(self, data):
+        metrics_dict = {"train": defaultdict(list), "val": defaultdict(list), "test": defaultdict(list)}
+
+        for seed in range(self.args.num_seeds):
+            fix_seed(seed)
+            self._ensure_edge_split(data, seed)
+            data_dict = torch.load(self._edge_split_file(seed), weights_only=False)
+            batch_loaders = generate_edge_loaders(data_dict, self.args)
+            train_data = build_edge_prediction_graph(data, data_dict, self.args)
+
+            model = self._build_model(train_data, TaskType.EDGE_PRED, 1)
+            optimizer = self._reset_and_prepare_model(model)
+
+            start_time = time.time()
+            best_score = -1.0
+            best_model = None
+
+            for epoch in tqdm(range(self.args.epochs)):
+                loss = self._train_edge_epoch(model, train_data, batch_loaders, optimizer)
+
+                if (epoch + 1) % self.args.display_step == 0:
+                    train_metrics, val_metrics, test_metrics = self._eval_edge(model, train_data, batch_loaders)
+                    if val_metrics["roc_average"] >= best_score:
+                        best_score = val_metrics["roc_average"]
+                        best_model = copy.deepcopy(model)
+                    print(f"Epoch: {epoch + 1:02d}, Training loss: {loss:.4f}")
+                    edge_evaluation_printer(train_metrics, val_metrics, test_metrics)
+
+            print(f"Training Time: {time.time() - start_time:.2f}")
+            eval_model = best_model if self._use_best_model() and best_model is not None else model
+            train_metrics, val_metrics, test_metrics = self._eval_edge(eval_model, train_data, batch_loaders)
+
+            print(f"------------------------------[Seed {seed}]-----------------------------------")
+            edge_evaluation_printer(train_metrics, val_metrics, test_metrics)
+            print(f"------------------------------------------------------------------------------")
+
+            for key, value in train_metrics.items():
+                metrics_dict["train"][key].append(value)
+            for key, value in val_metrics.items():
+                metrics_dict["val"][key].append(value)
+            for key, value in test_metrics.items():
+                metrics_dict["test"][key].append(value)
+
+        print(f"---------------------------------[Final]--------------------------------------")
+        avg_result_printer_edge(metrics_dict)
+        print(f"------------------------------------------------------------------------------")
+
+    def _train_hg_epoch(self, model, adapter, optimizer):
+        model.train()
+        keep_encoder_eval_if_linear_probe(model, self.args)
+        total_loss = 0.0
+        steps = 0
+
+        for batch in adapter:
+            if is_subgraph_mode(self.args):
+                batch.h_prime = append_graph_batch_role_features(batch.h_prime, TaskType.HG_CLS, self.args)
+            batch.h_prime = _prepare_hg_batch(batch.h_prime, self.args)
+            batch = batch.to(self.device)
+            optimizer.zero_grad()
+            logits = model(batch)
+            loss = F.cross_entropy(
+                logits,
+                batch.y.view(-1).long(),
+                label_smoothing=self._label_smoothing(),
+            )
+            loss.backward()
+            if self.args.clip_grad:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.clip_thresh)
+            optimizer.step()
+            total_loss += float(loss.item())
+            steps += 1
+
+        return total_loss / max(steps, 1)
+
+    @torch.no_grad()
+    def _eval_hg_split(self, model, batch_loaders, split: str):
+        model.eval()
+        preds = []
+        labels = []
+        adapter = GraphClsTaskAdapter(batch_loaders, split=split)
+        for batch in adapter:
+            if is_subgraph_mode(self.args):
+                batch.h_prime = append_graph_batch_role_features(batch.h_prime, TaskType.HG_CLS, self.args)
+            batch.h_prime = _prepare_hg_batch(batch.h_prime, self.args)
+            batch = batch.to(self.device)
+            logits = model(batch)
+            preds.append(logits.argmax(dim=-1).detach().cpu())
+            labels.append(batch.y.view(-1).detach().cpu())
+
+        if not preds:
+            return 0.0, 0.0
+        pred = torch.cat(preds).numpy()
+        label = torch.cat(labels).numpy()
+        return accuracy_score(label, pred), f1_score(label, pred, average="macro")
+
+    def _eval_hg(self, model, batch_loaders):
+        result = defaultdict(list)
+        for split in ("train", "val", "test"):
+            acc, macro_f1 = self._eval_hg_split(model, batch_loaders, split)
+            result["acc"].append(acc)
+            result["macro_f1"].append(macro_f1)
+        return result
+
+    def hg_cls_train_eval(self, data):
+        metrics_dict = defaultdict(list)
+
+        for seed in range(self.args.num_seeds):
+            fix_seed(seed)
+            train_set, val_set, test_set = generate_split_hypergraphs(
+                data,
+                self.args.train_prop,
+                self.args.valid_prop,
+                seed,
+            )
+            batch_loaders = generate_hg_loaders(train_set, val_set, test_set, self.args)
+
+            model = self._build_model(data, TaskType.HG_CLS, data.num_classes)
+            optimizer = self._reset_and_prepare_model(model)
+            train_adapter = GraphClsTaskAdapter(batch_loaders, split="train")
+
+            start_time = time.time()
+            best_score = -1.0
+            best_model = None
+
+            for epoch in tqdm(range(self.args.epochs)):
+                loss = self._train_hg_epoch(model, train_adapter, optimizer)
+                if (epoch + 1) % self.args.display_step == 0:
+                    result = self._eval_hg(model, batch_loaders)
+                    if result["acc"][1] >= best_score:
+                        best_score = result["acc"][1]
+                        best_model = copy.deepcopy(model)
+                    print(f"Epoch: {epoch + 1:02d}, Training loss: {loss:.4f}")
+                    hg_evaluation_printer(result)
+
+            print(f"Training Time: {time.time() - start_time:.2f}")
+            eval_model = best_model if self._use_best_model() and best_model is not None else model
+            result = self._eval_hg(eval_model, batch_loaders)
+
+            print(f"------------------------------[Seed {seed}]-----------------------------------")
+            hg_evaluation_printer(result)
+            print(f"------------------------------------------------------------------------------")
+
+            for metric_name, values in result.items():
+                metrics_dict[metric_name].append(values)
+
+        print(f"---------------------------------[Final]--------------------------------------")
+        for metric_name, values in metrics_dict.items():
+            result_printer(values, metric_name)
+        print(f"------------------------------------------------------------------------------")
+
+    def running(self, task_type, data):
+        if task_type == "node_cls":
+            self.node_cls_train_eval(data)
+        elif task_type == "edge_pred":
+            self.edge_pred_train_eval(data)
+        elif task_type == "hg_cls":
+            self.hg_cls_train_eval(data)
+        else:
+            raise NotImplementedError

@@ -1,0 +1,23 @@
+default:
+  All_num_layers: 2
+  embedding_hidden: 128
+  MLP_hidden: 128
+  epochs: 100
+  dropout: 0.5
+  lr: 1.0e-3 # 科学计数法表示用浮点数
+  wd: 0.0
+
+  normalization: "ln"
+  InputNorm: false
+
+cora:
+  All_num_layers: 2
+  embedding_hidden: 128
+  MLP_hidden: 128
+  epochs: 100
+  dropout: 0.5
+  lr: 1.0e-3 # 科学计数法表示用浮点数
+  wd: 0.0
+
+  normalization: "ln"
+  InputNorm: false

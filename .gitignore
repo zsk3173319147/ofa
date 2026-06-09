@@ -1,0 +1,14 @@
+data/
+*.pt
+*.pickle
+*.pkl
+checkpoints/
+runs/
+outputs/
+data/
+*.pt
+*.pickle
+*.pkl
+checkpoints/
+runs/
+outputs/

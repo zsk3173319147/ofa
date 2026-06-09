@@ -1,0 +1,22 @@
+default:
+  HCHA_symdegnorm: false 
+  All_num_layers: 2
+  embedding_hidden: 128
+  MLP_hidden: 128
+  epochs: 100
+  dropout: 0.2
+  lr: 1.0e-3 
+  wd: 0.0
+
+RHG_10:
+  HCHA_symdegnorm: false 
+  All_num_layers: 1
+  embedding_hidden: 64
+  MLP_hidden: 64
+  epochs: 300
+  dropout: 0.2
+  lr: 1.0e-3 
+  wd: 0
+  pooling: "max"
+  early_stop: true
+

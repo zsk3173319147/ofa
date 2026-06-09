@@ -1,0 +1,29 @@
+default:
+  All_num_layers: 2
+  MLP_hidden: 256
+  epochs: 50 # 62.82+-0.13
+  lr: 1.0e-3
+  wd: 0.0
+  dropout: 0.8
+
+  input_drop: 0.5
+  activation: "prelu" # activation: ['relu', 'prelu']
+  use_norm: False
+  restart_alpha: 0.3
+  lamda: 0.8
+  reduce: 'mean'
+
+cora:
+  All_num_layers: 2
+  MLP_hidden: 256
+  epochs: 50 # 62.82+-0.13
+  lr: 1.0e-3
+  wd: 0.0
+  dropout: 0.8
+
+  input_drop: 0.5
+  activation: "prelu" # activation: ['relu', 'prelu']
+  use_norm: False
+  restart_alpha: 0.3
+  lamda: 0.8
+  reduce: 'mean'
