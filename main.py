@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent / 'dhgbench'))
 from lib_utils.exp_agent import ExpAgent
-from lib_utils.unified_agent import UnifiedExpAgent
+from lib_utils.subgraph_agent import SubgraphExpAgent
 from lib_models.HNN.preprocessing import algo_preprocessing
 from lib_dataset.data_base import HyperDataset
 from lib_dataset.preprocessing import data_processing
@@ -46,8 +46,8 @@ if __name__ == '__main__':
             evasion_data = algo_preprocessing(evasion_data,args)
             data.evasion_data = evasion_data # store evasion data
     
-    if args.downstream_mode == "unified":
-        agent = UnifiedExpAgent(args)
+    if args.downstream_mode == "subgraph":
+        agent = SubgraphExpAgent(args)
     else:
         agent = ExpAgent(args)
     agent.running(args.task_type,data)

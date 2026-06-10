@@ -10,7 +10,7 @@ from torch_geometric.data import Data
 from .base import GraphQuery, TaskBatch, TaskType, normalize_split_name
 
 
-SUBGRAPH_ROLE_DIM = 3
+SUBGRAPH_ROLE_DIM = 1
 
 
 def is_subgraph_mode(args: Any) -> bool:
@@ -21,17 +21,6 @@ def subgraph_role_dim(args: Any) -> int:
     if not bool(getattr(args, "subgraph_add_role_features", True)):
         return 0
     return int(getattr(args, "subgraph_role_dim", SUBGRAPH_ROLE_DIM))
-
-
-def task_scalar(task_type: TaskType | str) -> float:
-    task_type = TaskType(task_type)
-    if task_type == TaskType.NODE_CLS:
-        return 0.0
-    if task_type == TaskType.EDGE_PRED:
-        return 0.5
-    if task_type == TaskType.HG_CLS:
-        return 1.0
-    return 0.0
 
 
 def _get_hyperedge_index(data: Any) -> torch.Tensor:
@@ -88,10 +77,6 @@ def append_subgraph_role_features(
     role = x.new_zeros((x.shape[0], role_dim))
     if role_dim >= 1:
         role[:, 0] = query_mask.to(dtype=x.dtype)
-    if role_dim >= 2:
-        role[:, 1] = (~query_mask).to(dtype=x.dtype)
-    if role_dim >= 3:
-        role[:, 2] = task_scalar(task_type)
     return torch.cat([x, role], dim=-1)
 
 
@@ -305,6 +290,8 @@ class NodeClsSubgraphTaskAdapter:
         split: str = "train",
         batch_size: Optional[int] = None,
         shuffle: bool = False,
+        builder: Optional[PropagationSubgraphBuilder] = None,
+        cache: Optional[bool] = None,
     ) -> None:
         self.data = data
         self.labels = data.y if hasattr(data, "y") else data.data.y
@@ -313,7 +300,11 @@ class NodeClsSubgraphTaskAdapter:
         self.split = normalize_split_name(split)
         self.batch_size = batch_size or int(getattr(args, "subgraph_batch_size", 128))
         self.shuffle = shuffle
-        self.builder = PropagationSubgraphBuilder(data, args)
+        self.builder = builder or PropagationSubgraphBuilder(data, args)
+        self.cache = bool(getattr(args, "subgraph_cache", True)) if cache is None else bool(cache)
+        self.node_ids = self._node_ids().detach().cpu()
+        self.graphs = self._build_cached_graphs() if self.cache else None
+        self.batches = self._build_cached_batches() if self.graphs is not None else None
 
     def _node_ids(self) -> torch.Tensor:
         mask_or_idx = self.masks[self.split]
@@ -321,28 +312,83 @@ class NodeClsSubgraphTaskAdapter:
             return mask_or_idx.nonzero(as_tuple=False).view(-1)
         return mask_or_idx.view(-1).long()
 
-    def __iter__(self) -> Iterator[TaskBatch]:
-        node_ids = self._node_ids().detach().cpu()
-        if node_ids.numel() == 0:
-            return
-        if self.shuffle:
-            node_ids = node_ids[torch.randperm(node_ids.numel())]
+    def _build_cached_graphs(self) -> list[Data]:
+        if self.node_ids.numel() == 0:
+            return []
 
-        for start in range(0, node_ids.numel(), self.batch_size):
-            batch_ids = node_ids[start : start + self.batch_size]
-            labels = self.labels.detach().cpu()[batch_ids]
-            subgraph_batch = self.builder.build_batch(
-                [[int(node_id)] for node_id in batch_ids.tolist()],
-                labels,
+        labels = self.labels.detach().cpu()[self.node_ids]
+        return [
+            self.builder.build_graph(
+                [int(node_id)],
+                labels[offset],
                 self.task_type,
                 exclude_exact_seed_edge=False,
             )
-            graph_ids = torch.arange(int(labels.numel()), dtype=torch.long)
+            for offset, node_id in enumerate(self.node_ids.tolist())
+        ]
+
+    def __len__(self) -> int:
+        count = int(self.node_ids.numel())
+        if count == 0:
+            return 0
+        return (count + self.batch_size - 1) // self.batch_size
+
+    def _build_cached_batches(self) -> list[tuple[torch.Tensor, Data]]:
+        batches = []
+        for start in range(0, self.node_ids.numel(), self.batch_size):
+            batch_ids = self.node_ids[start : start + self.batch_size]
+            graphs = self.graphs[start : start + self.batch_size]
+            batches.append((batch_ids, _batch_subgraphs(graphs)))
+        return batches
+
+    def __iter__(self) -> Iterator[TaskBatch]:
+        node_ids = self.node_ids
+        if node_ids.numel() == 0:
+            return
+
+        if self.batches is not None:
+            batch_order = torch.arange(len(self.batches))
+            if self.shuffle:
+                batch_order = batch_order[torch.randperm(batch_order.numel())]
+
+            for batch_idx in batch_order.tolist():
+                batch_ids, subgraph_batch = self.batches[int(batch_idx)]
+                graph_ids = torch.arange(int(subgraph_batch.y.numel()), dtype=torch.long)
+                yield TaskBatch(
+                    h_prime=subgraph_batch,
+                    query=GraphQuery(graph_ids),
+                    task_type=self.task_type,
+                    y=subgraph_batch.y,
+                    split=self.split,
+                    metadata={"node_ids": batch_ids},
+                )
+            return
+
+        order = torch.arange(node_ids.numel())
+        if self.shuffle:
+            order = order[torch.randperm(order.numel())]
+
+        for start in range(0, order.numel(), self.batch_size):
+            batch_order = order[start : start + self.batch_size]
+            batch_ids = node_ids[batch_order]
+
+            if self.graphs is not None:
+                subgraph_batch = _batch_subgraphs([self.graphs[int(idx)] for idx in batch_order.tolist()])
+            else:
+                labels = self.labels.detach().cpu()[batch_ids]
+                subgraph_batch = self.builder.build_batch(
+                    [[int(node_id)] for node_id in batch_ids.tolist()],
+                    labels,
+                    self.task_type,
+                    exclude_exact_seed_edge=False,
+                )
+
+            graph_ids = torch.arange(int(subgraph_batch.y.numel()), dtype=torch.long)
             yield TaskBatch(
                 h_prime=subgraph_batch,
                 query=GraphQuery(graph_ids),
                 task_type=self.task_type,
-                y=labels,
+                y=subgraph_batch.y,
                 split=self.split,
                 metadata={"node_ids": batch_ids},
             )

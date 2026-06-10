@@ -4,6 +4,7 @@ import copy
 import os
 import time
 from collections import defaultdict
+from typing import Optional
 
 import numpy as np
 import torch
@@ -16,32 +17,22 @@ from lib_dataset.hg_loaders import generate_hg_loaders, generate_split_hypergrap
 from lib_models.HNN.preprocessing import algo_preprocessing
 from lib_utils.exp_agent import build_edge_prediction_graph, parse_model
 from lib_utils.metrics import avg_result_printer_edge, edge_evaluation_printer, hg_evaluation_printer
+from lib_utils.subgraph_model import SubgraphDownstreamModel
 from lib_utils.train_agent import (
     freeze_encoder_if_linear_probe,
     keep_encoder_eval_if_linear_probe,
     load_pretrained_encoder_if_requested,
-    trainable_parameters,
 )
-from lib_utils.unified_model import UnifiedDownstreamModel
 from lib_utils.utils import add_self_loop_hyperedges, fix_seed, mean_std_metrics, relabel_hyperedge_index, result_printer
 from tasker import (
     GraphClsTaskAdapter,
-    HyperedgeQuery,
     NodeClsSubgraphTaskAdapter,
-    NodeClsTaskAdapter,
     PropagationSubgraphBuilder,
-    TaskBatch,
     TaskType,
     append_graph_batch_role_features,
     build_edge_subgraph_task_batch,
-    is_subgraph_mode,
     model_data_with_subgraph_schema,
 )
-
-
-def _node_batch_size(args) -> int | None:
-    value = getattr(args, "unified_node_batch_size", None)
-    return int(value) if value else None
 
 
 def _prepare_hg_batch(batch, args):
@@ -61,34 +52,31 @@ def _prepare_hg_batch(batch, args):
 
 
 def _new_optimizer(model, args):
-    if is_subgraph_mode(args):
-        base_lr = float(getattr(args, "subgraph_lr", None) or args.lr)
-        base_wd = float(getattr(args, "subgraph_wd", None) if getattr(args, "subgraph_wd", None) is not None else args.wd)
-        encoder_lr = base_lr * float(getattr(args, "subgraph_encoder_lr_scale", 1.0))
-        head_lr = base_lr * float(getattr(args, "subgraph_head_lr_scale", 1.0))
+    base_lr = float(getattr(args, "subgraph_lr", None) or args.lr)
+    base_wd = float(getattr(args, "subgraph_wd", None) if getattr(args, "subgraph_wd", None) is not None else args.wd)
+    encoder_lr = base_lr * float(getattr(args, "subgraph_encoder_lr_scale", 1.0))
+    head_lr = base_lr * float(getattr(args, "subgraph_head_lr_scale", 1.0))
 
-        encoder_params = []
-        head_params = []
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
-            if name.startswith("encoder."):
-                encoder_params.append(param)
-            else:
-                head_params.append(param)
+    encoder_params = []
+    head_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith("encoder."):
+            encoder_params.append(param)
+        else:
+            head_params.append(param)
 
-        param_groups = []
-        if encoder_params:
-            param_groups.append({"params": encoder_params, "lr": encoder_lr, "weight_decay": base_wd})
-        if head_params:
-            param_groups.append({"params": head_params, "lr": head_lr, "weight_decay": base_wd})
-        return torch.optim.Adam(param_groups, lr=base_lr, weight_decay=base_wd)
-
-    return torch.optim.Adam(trainable_parameters(model), lr=args.lr, weight_decay=args.wd)
+    param_groups = []
+    if encoder_params:
+        param_groups.append({"params": encoder_params, "lr": encoder_lr, "weight_decay": base_wd})
+    if head_params:
+        param_groups.append({"params": head_params, "lr": head_lr, "weight_decay": base_wd})
+    return torch.optim.Adam(param_groups, lr=base_lr, weight_decay=base_wd)
 
 
-class UnifiedExpAgent:
-    """Downstream-only unified path based on TaskBatch and target-aware readout."""
+class SubgraphExpAgent:
+    """Downstream path: extract subgraphs, encode them with HGNN, then classify each subgraph."""
 
     def __init__(self, args):
         self.args = args
@@ -99,9 +87,9 @@ class UnifiedExpAgent:
 
     def _build_model(self, data, task_type: TaskType, num_targets: int):
         self.args.embedding_mode = True
-        model_data = model_data_with_subgraph_schema(data, self.args) if is_subgraph_mode(self.args) else data
+        model_data = model_data_with_subgraph_schema(data, self.args)
         encoder = parse_model(self.args, model_data)
-        model = UnifiedDownstreamModel(encoder, task_type, num_targets, self.args)
+        model = SubgraphDownstreamModel(encoder, task_type, num_targets, self.args)
         if self.args.method != "TMPHN":
             model = model.to(self.device)
         return model
@@ -113,14 +101,35 @@ class UnifiedExpAgent:
         return _new_optimizer(model, self.args)
 
     def _label_smoothing(self) -> float:
-        if not is_subgraph_mode(self.args):
-            return 0.0
         return max(float(getattr(self.args, "subgraph_label_smoothing", 0.0)), 0.0)
 
     def _use_best_model(self) -> bool:
-        return bool(getattr(self.args, "early_stop", False)) or (
-            is_subgraph_mode(self.args) and bool(getattr(self.args, "subgraph_use_best_model", True))
+        return bool(getattr(self.args, "early_stop", False)) or bool(getattr(self.args, "subgraph_use_best_model", False))
+
+    def _prepare_batch(self, batch):
+        if not bool(getattr(batch.h_prime, "_subgraph_prepared", False)):
+            batch.h_prime = _prepare_hg_batch(batch.h_prime, self.args)
+            batch.h_prime._subgraph_prepared = True
+        return batch.to(self.device)
+
+    def _node_adapter(self, data, masks, split: str, shuffle: bool, builder: Optional[PropagationSubgraphBuilder] = None):
+        return NodeClsSubgraphTaskAdapter(
+            data,
+            masks,
+            self.args,
+            split=split,
+            batch_size=getattr(self.args, "subgraph_batch_size", 128),
+            shuffle=shuffle,
+            builder=builder,
         )
+
+    def _subgraph_builder(self, data) -> PropagationSubgraphBuilder:
+        key = id(data)
+        builder = self._subgraph_builders.get(key)
+        if builder is None:
+            builder = PropagationSubgraphBuilder(data, self.args)
+            self._subgraph_builders[key] = builder
+        return builder
 
     def _train_node_epoch(self, model, adapter, optimizer):
         model.train()
@@ -129,7 +138,7 @@ class UnifiedExpAgent:
         steps = 0
 
         for batch in adapter:
-            batch = self._prepare_unified_batch(batch)
+            batch = self._prepare_batch(batch)
             optimizer.zero_grad()
             logits = model(batch)
             loss = F.cross_entropy(logits, batch.y.long(), label_smoothing=self._label_smoothing())
@@ -142,45 +151,13 @@ class UnifiedExpAgent:
 
         return total_loss / max(steps, 1)
 
-    def _prepare_unified_batch(self, batch: TaskBatch) -> TaskBatch:
-        if is_subgraph_mode(self.args):
-            batch.h_prime = _prepare_hg_batch(batch.h_prime, self.args)
-        return batch.to(self.device)
-
-    def _node_adapter(self, data, masks, split: str, shuffle: bool):
-        if is_subgraph_mode(self.args):
-            return NodeClsSubgraphTaskAdapter(
-                data,
-                masks,
-                self.args,
-                split=split,
-                batch_size=getattr(self.args, "subgraph_batch_size", 128),
-                shuffle=shuffle,
-            )
-        return NodeClsTaskAdapter(
-            data,
-            masks,
-            split=split,
-            batch_size=_node_batch_size(self.args),
-            shuffle=shuffle,
-        )
-
-    def _subgraph_builder(self, data) -> PropagationSubgraphBuilder:
-        key = id(data)
-        builder = self._subgraph_builders.get(key)
-        if builder is None:
-            builder = PropagationSubgraphBuilder(data, self.args)
-            self._subgraph_builders[key] = builder
-        return builder
-
     @torch.no_grad()
-    def _eval_node_split(self, model, data, masks, split: str):
+    def _eval_node_split(self, model, adapter):
         model.eval()
-        adapter = self._node_adapter(data, masks, split=split, shuffle=False)
         preds = []
         labels = []
         for batch in adapter:
-            batch = self._prepare_unified_batch(batch)
+            batch = self._prepare_batch(batch)
             logits = model(batch)
             preds.append(logits.argmax(dim=-1).detach().cpu())
             labels.append(batch.y.detach().cpu())
@@ -192,11 +169,11 @@ class UnifiedExpAgent:
         return accuracy_score(label, pred) * 100.0
 
     @torch.no_grad()
-    def _eval_node(self, model, data, masks):
+    def _eval_node(self, model, adapters):
         return [
-            self._eval_node_split(model, data, masks, "train"),
-            self._eval_node_split(model, data, masks, "valid"),
-            self._eval_node_split(model, data, masks, "test"),
+            self._eval_node_split(model, adapters["train"]),
+            self._eval_node_split(model, adapters["valid"]),
+            self._eval_node_split(model, adapters["test"]),
         ]
 
     def node_cls_train_eval(self, data):
@@ -209,10 +186,24 @@ class UnifiedExpAgent:
                 val_ratio=self.args.valid_prop,
                 seed=seed,
             )
+            cache_start = time.time()
+            builder = self._subgraph_builder(data)
+            adapters = {
+                "train": self._node_adapter(data, masks, split="train", shuffle=True, builder=builder),
+                "valid": self._node_adapter(data, masks, split="valid", shuffle=False, builder=builder),
+                "test": self._node_adapter(data, masks, split="test", shuffle=False, builder=builder),
+            }
+            if bool(getattr(self.args, "subgraph_cache", True)):
+                node_count = sum(int(adapter.node_ids.numel()) for adapter in adapters.values())
+                batch_count = sum(len(adapter) for adapter in adapters.values())
+                print(
+                    f"Cached node subgraphs: {node_count} samples, "
+                    f"{batch_count} batches, {time.time() - cache_start:.2f}s"
+                )
 
             model = self._build_model(data, TaskType.NODE_CLS, data.num_classes)
             optimizer = self._reset_and_prepare_model(model)
-            train_adapter = self._node_adapter(data, masks, split="train", shuffle=True)
+            train_adapter = adapters["train"]
 
             start_time = time.time()
             best_score = -1.0
@@ -222,7 +213,7 @@ class UnifiedExpAgent:
                 loss = self._train_node_epoch(model, train_adapter, optimizer)
 
                 if (epoch + 1) % self.args.display_step == 0:
-                    result = self._eval_node(model, data, masks)
+                    result = self._eval_node(model, adapters)
                     if result[1] >= best_score:
                         best_score = result[1]
                         best_model = copy.deepcopy(model)
@@ -233,7 +224,7 @@ class UnifiedExpAgent:
             print(f"Training Time: {train_time:.2f}")
 
             eval_model = best_model if self._use_best_model() and best_model is not None else model
-            result = self._eval_node(eval_model, data, masks)
+            result = self._eval_node(eval_model, adapters)
             if eval_model is best_model:
                 print(f"Using best validation model with score: {best_score:.4f}")
             print(f"------------------------------[Seed {seed}]-----------------------------------")
@@ -265,19 +256,10 @@ class UnifiedExpAgent:
             raise NotImplementedError
 
     def _edge_task_batch(self, data, hyperedges, labels):
-        if is_subgraph_mode(self.args):
-            builder = self._subgraph_builder(data)
-            batch = build_edge_subgraph_task_batch(builder, hyperedges, labels)
-            batch.h_prime = _prepare_hg_batch(batch.h_prime, self.args)
-            return batch.to(self.device)
-
-        return TaskBatch(
-            h_prime=data,
-            query=HyperedgeQuery(hyperedges),
-            task_type=TaskType.EDGE_PRED,
-            y=labels,
-            split="edge_pred",
-        ).to(self.device)
+        builder = self._subgraph_builder(data)
+        batch = build_edge_subgraph_task_batch(builder, hyperedges, labels)
+        batch.h_prime = _prepare_hg_batch(batch.h_prime, self.args)
+        return batch.to(self.device)
 
     def _train_edge_epoch(self, model, data, batch_loaders, optimizer):
         model.train()
@@ -297,9 +279,8 @@ class UnifiedExpAgent:
             optimizer.zero_grad()
             logits = model(batch)
             targets = batch.y.float()
-            if is_subgraph_mode(self.args):
-                eps = min(self._label_smoothing(), 0.49)
-                targets = targets * (1.0 - 2.0 * eps) + eps
+            eps = min(self._label_smoothing(), 0.49)
+            targets = targets * (1.0 - 2.0 * eps) + eps
             loss = F.binary_cross_entropy_with_logits(logits, targets)
             loss.backward()
             if self.args.clip_grad:
@@ -432,8 +413,7 @@ class UnifiedExpAgent:
         steps = 0
 
         for batch in adapter:
-            if is_subgraph_mode(self.args):
-                batch.h_prime = append_graph_batch_role_features(batch.h_prime, TaskType.HG_CLS, self.args)
+            batch.h_prime = append_graph_batch_role_features(batch.h_prime, TaskType.HG_CLS, self.args)
             batch.h_prime = _prepare_hg_batch(batch.h_prime, self.args)
             batch = batch.to(self.device)
             optimizer.zero_grad()
@@ -459,8 +439,7 @@ class UnifiedExpAgent:
         labels = []
         adapter = GraphClsTaskAdapter(batch_loaders, split=split)
         for batch in adapter:
-            if is_subgraph_mode(self.args):
-                batch.h_prime = append_graph_batch_role_features(batch.h_prime, TaskType.HG_CLS, self.args)
+            batch.h_prime = append_graph_batch_role_features(batch.h_prime, TaskType.HG_CLS, self.args)
             batch.h_prime = _prepare_hg_batch(batch.h_prime, self.args)
             batch = batch.to(self.device)
             logits = model(batch)
