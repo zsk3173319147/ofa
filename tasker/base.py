@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional
 
 import torch
 
@@ -11,43 +11,6 @@ class TaskType(str, Enum):
     NODE_CLS = "node_cls"
     EDGE_PRED = "edge_pred"
     HG_CLS = "hg_cls"
-    SSL_HYPEREDGE_FILL = "ssl_hyperedge_fill"
-    SSL_CONTRAST = "ssl_contrast"
-
-
-@dataclass
-class NodeQuery:
-    node_ids: torch.Tensor
-
-    def to(self, device: torch.device | str) -> "NodeQuery":
-        self.node_ids = self.node_ids.to(device)
-        return self
-
-
-@dataclass
-class HyperedgeQuery:
-    hyperedges: Sequence[torch.Tensor]
-
-    def to(self, device: torch.device | str) -> "HyperedgeQuery":
-        self.hyperedges = [edge.to(device) for edge in self.hyperedges]
-        return self
-
-
-@dataclass
-class PartialHyperedgeQuery:
-    contexts: Sequence[torch.Tensor]
-    candidate_nodes: torch.Tensor
-    hyperedge_ids: Optional[torch.Tensor] = None
-    target_nodes: Optional[torch.Tensor] = None
-
-    def to(self, device: torch.device | str) -> "PartialHyperedgeQuery":
-        self.contexts = [context.to(device) for context in self.contexts]
-        self.candidate_nodes = self.candidate_nodes.to(device)
-        if self.hyperedge_ids is not None:
-            self.hyperedge_ids = self.hyperedge_ids.to(device)
-        if self.target_nodes is not None:
-            self.target_nodes = self.target_nodes.to(device)
-        return self
 
 
 @dataclass
@@ -61,20 +24,9 @@ class GraphQuery:
 
 
 @dataclass
-class ContrastiveQuery:
-    anchor_type: str
-    anchor_ids: Optional[torch.Tensor] = None
-
-    def to(self, device: torch.device | str) -> "ContrastiveQuery":
-        if self.anchor_ids is not None:
-            self.anchor_ids = self.anchor_ids.to(device)
-        return self
-
-
-@dataclass
 class TaskBatch:
     h_prime: Any
-    query: NodeQuery | HyperedgeQuery | PartialHyperedgeQuery | GraphQuery | ContrastiveQuery
+    query: GraphQuery
     task_type: TaskType | str
     y: Optional[torch.Tensor] = None
     split: Optional[str] = None
@@ -94,7 +46,7 @@ class TaskBatch:
         self,
     ) -> tuple[
         Any,
-        NodeQuery | HyperedgeQuery | PartialHyperedgeQuery | GraphQuery | ContrastiveQuery,
+        GraphQuery,
         TaskType,
         Optional[torch.Tensor],
     ]:

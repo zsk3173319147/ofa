@@ -44,24 +44,6 @@ def method_config(args):
 
     return args
 
-def pretrain_config(args):
-    config_path = os.path.join('./', 'lib_yamls', 'pretrain_yamls', f'config_{args.method.lower()}.yaml')
-    if not os.path.exists(config_path):
-        return args
-
-    try:
-        conf_dt = yaml.safe_load(open(config_path)) or {}
-        updates = {}
-        if conf_dt.get('default') is not None:
-            updates.update(conf_dt['default'])
-        if conf_dt.get(args.dname) is not None:
-            updates.update(conf_dt[args.dname])
-        update_from_dict(args, updates, skip_keys=explicit_cli_keys())
-    except:
-        print('No pretrain config file found or error in yaml format, please use command-line pretrain arguments')
-
-    return args
-
 def str2bool(v):
     if isinstance(v, bool):
         return v
@@ -89,22 +71,12 @@ def set_task_args(args):
         if args.use_bench_prop:
             args.train_prop,args.valid_prop = 0.8,0.1
         args.early_stop = True
-        if args.method in ['EHNN','TMPHN']:
-            raise ValueError(f'{args.method} is not supoorted for hypergraph classification task') 
     else:
         if args.dname not in _single_datasets_:
             raise ValueError('The dataset is not suitable for edge prediction')
 
-        if args.method in ['HyperND']:
-            args.add_self_loop=True 
-        elif args.method in ['DPHGNN','LEGCN','PhenomNN','HJRL','TFHNN','HNHN','AllSetformer'] and args.dname in ['pokec']:
+        if args.method in ['HNHN','AllSetformer'] and args.dname in ['pokec']:
             args.add_self_loop=True
-        elif args.method in ['TMPHN']:
-            if args.dname in ['pokec']:
-                args.add_self_loop=True
-            else:
-                args.add_self_loop=False
-            args.device='cpu' 
         else:
             args.add_self_loop=False
         if args.use_bench_prop:
@@ -142,15 +114,20 @@ def parameter_parser():
                                                             "stream_player","twitter_friend"])
     
     parser.add_argument('--task_type',default='edge_pred',choices=['node_cls','edge_pred','hg_cls'])
+    parser.add_argument('--pipeline', default='subgraph', choices=['baseline', 'subgraph'])
     parser.add_argument('--is_default',default=False)
     parser.add_argument('--use_processed', default=True)
-    parser.add_argument('--method', default='HGNN') 
+    parser.add_argument(
+        '--method',
+        default='HGNN',
+        choices=['HGNN', 'HNHN', 'MLP', 'UniGIN', 'UniGCNII', 'AllSetformer', 'AllDeepSets'],
+    )
     
     parser.add_argument('--device', default='cuda:3')
     parser.add_argument('--num_seeds', type=int, default=5)
     parser.add_argument('--epochs', default=5, type=int) 
     parser.add_argument('--dropout', default=0.5, type=float)
-    parser.add_argument('--lr', default=0.001, type=float) # []
+    parser.add_argument('--lr', default=0.0001, type=float) # []
     parser.add_argument('--wd', default=0.0, type=float)
     parser.add_argument('--clip_grad',default=False,type=bool)
     parser.add_argument('--clip_thresh',default=5.0,type=float)
@@ -159,21 +136,14 @@ def parameter_parser():
     parser.add_argument('--mem_display_step',default=100)
     parser.add_argument('--display_step', type=int, default=20)
     parser.add_argument('--eval_verbose',default=True)
-    parser.add_argument('--downstream_mode', default='finetune', choices=['finetune','encoder_finetune','linear_probe','zero_shot','subgraph'])
-    parser.add_argument('--subgraph_head_type', default='auto', choices=['auto','linear','mlp'])
     parser.add_argument('--subgraph_mode', default='propagation', choices=['propagation'])
     parser.add_argument('--subgraph_context_hops', default=1, type=int)
-    parser.add_argument('--subgraph_max_nodes', default=16, type=int)
+    parser.add_argument('--subgraph_max_nodes', default=0, type=int)
     parser.add_argument('--subgraph_max_hyperedges', default=8, type=int)
     parser.add_argument('--subgraph_batch_size', default=256, type=int)
     parser.add_argument('--subgraph_cache', default=True, type=str2bool)
     parser.add_argument('--subgraph_add_role_features', default=True, type=str2bool)
     parser.add_argument('--subgraph_role_dim', default=1, type=int)
-    parser.add_argument('--subgraph_lr', default=0.0003, type=float)
-    parser.add_argument('--subgraph_wd', default=0.0005, type=float)
-    parser.add_argument('--subgraph_encoder_lr_scale', default=0.5, type=float)
-    parser.add_argument('--subgraph_head_lr_scale', default=1.0, type=float)
-    parser.add_argument('--subgraph_label_smoothing', default=0.05, type=float)
     parser.add_argument('--subgraph_use_best_model', default=False, type=str2bool)
     
     parser.add_argument('--embedding_mode',default=True,type=bool) 
@@ -190,7 +160,7 @@ def parameter_parser():
     parser.add_argument('--e_embed_layer',default=2)
     parser.add_argument('--e_embed_dropout',default=0.2) 
     parser.add_argument('--e_embed_norm',default='ln') 
-    parser.add_argument('--aggr_mode',default='max',choices=['max','mean','maxmin'])
+    parser.add_argument('--aggr_mode',default='maxmin',choices=['max','mean','maxmin'])
     parser.add_argument('--ns_method',default='mixed',choices=['mns','sns','cns','mixed']) 
     parser.add_argument('--edge_aggr',default='group',choices=['group','single'])
     
@@ -213,41 +183,6 @@ def parameter_parser():
     # Choose std for synthetic feature noise
     parser.add_argument('--feature_noise', default='0.6', type=str)
 
-    ######################### pretraining parameters ###########################
-    parser.add_argument('--pretrain_epochs', default=10, type=int)
-    parser.add_argument('--pretrain_lr', default=None, type=float)
-    parser.add_argument('--pretrain_wd', default=None, type=float)
-    parser.add_argument('--pretrain_grad_clip', default=None, type=float)
-    parser.add_argument('--pretrain_display_step', default=1, type=int)
-    parser.add_argument('--pretrain_seed', default=0, type=int)
-    parser.add_argument('--pretrain_tasks', default='fill,contrast', type=str)
-    parser.add_argument('--pretrain_save_path', default='', type=str)
-    parser.add_argument('--pretrain_load_path', default='', type=str)
-    parser.add_argument('--pretrain_graph_scope', default='full', choices=['full','edge_train'])
-    parser.add_argument('--pretrain_split_seed', default=0, type=int)
-    parser.add_argument('--pretrain_hg_batch_size', default=None, type=int)
-
-    parser.add_argument('--fill_batch_size', default=256, type=int)
-    parser.add_argument('--fill_num_negatives', default=15, type=int)
-    parser.add_argument('--fill_samples_per_epoch', default=None, type=int)
-    parser.add_argument('--fill_samples_per_graph_batch', default=None, type=int)
-    parser.add_argument('--fill_loss_weight', default=1.0, type=float)
-    parser.add_argument('--hypeboy_feature_mask_rate', default=0.1, type=float)
-    parser.add_argument('--hypeboy_edge_drop_rate', default=0.1, type=float)
-    parser.add_argument('--hypeboy_projection_hidden', default=None, type=int)
-    parser.add_argument('--hypeboy_projection_dim', default=None, type=int)
-    parser.add_argument('--hypeboy_projection_dropout', default=0.0, type=float)
-    parser.add_argument('--hypeboy_temperature', default=1.0, type=float)
-    parser.add_argument('--hypeboy_query_batch_size', default=4096, type=int)
-
-    parser.add_argument('--contrast_batch_size', default=1024, type=int)
-    parser.add_argument('--contrast_views_per_epoch', default=1, type=int)
-    parser.add_argument('--contrast_anchor_type', default='node', choices=['node','hyperedge','graph'])
-    parser.add_argument('--drop_incidence_rate', default=0.2, type=float)
-    parser.add_argument('--drop_feature_rate', default=0.0, type=float)
-    parser.add_argument('--contrast_temperature', default=0.2, type=float)
-    parser.add_argument('--contrast_loss_weight', default=1.0, type=float)
-    
     parser.set_defaults(add_self_loop=False)
     parser.set_defaults(exclude_self=False)
 

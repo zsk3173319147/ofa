@@ -1,5 +1,5 @@
 default:
-  HCHA_symdegnorm: false 
+  HGNN_symdegnorm: false 
   All_num_layers: 2
   embedding_hidden: 128
   MLP_hidden: 128
@@ -9,7 +9,7 @@ default:
   wd: 0.0
 
 RHG_10:
-  HCHA_symdegnorm: false 
+  HGNN_symdegnorm: false 
   All_num_layers: 1
   embedding_hidden: 64
   MLP_hidden: 64

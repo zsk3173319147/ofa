@@ -1,7 +1,9 @@
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent / 'dhgbench'))
-from lib_utils.exp_agent import ExpAgent
+from lib_utils.parallel_config import configure_cpu_parallelism
+configure_cpu_parallelism()
+from lib_utils.baseline_agent import BaselineExpAgent
 from lib_utils.subgraph_agent import SubgraphExpAgent
 from lib_models.HNN.preprocessing import algo_preprocessing
 from lib_dataset.data_base import HyperDataset
@@ -46,8 +48,10 @@ if __name__ == '__main__':
             evasion_data = algo_preprocessing(evasion_data,args)
             data.evasion_data = evasion_data # store evasion data
     
-    if args.downstream_mode == "subgraph":
+    if args.pipeline == 'baseline':
+        agent = BaselineExpAgent(args)
+    elif args.pipeline == 'subgraph':
         agent = SubgraphExpAgent(args)
     else:
-        agent = ExpAgent(args)
+        raise ValueError(f'Unsupported pipeline: {args.pipeline}')
     agent.running(args.task_type,data)

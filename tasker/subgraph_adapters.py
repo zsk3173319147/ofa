@@ -97,6 +97,7 @@ def _batch_subgraphs(graphs: Sequence[Data]) -> Data:
     xs = []
     ys = []
     batch_vec = []
+    query_masks = []
     hyperedge_parts = []
     node_offset = 0
     edge_offset = 0
@@ -107,6 +108,10 @@ def _batch_subgraphs(graphs: Sequence[Data]) -> Data:
         xs.append(x)
         ys.append(graph.y.view(-1))
         batch_vec.append(torch.full((x.shape[0],), graph_id, dtype=torch.long))
+        if hasattr(graph, "query_mask"):
+            query_masks.append(graph.query_mask.view(-1).bool())
+        else:
+            query_masks.append(torch.zeros(x.shape[0], dtype=torch.bool))
 
         if hyperedge_index.numel() > 0:
             shifted = hyperedge_index.clone()
@@ -120,6 +125,7 @@ def _batch_subgraphs(graphs: Sequence[Data]) -> Data:
     x = torch.cat(xs, dim=0)
     y = torch.cat(ys, dim=0)
     batch = torch.cat(batch_vec, dim=0)
+    query_mask = torch.cat(query_masks, dim=0)
     if hyperedge_parts:
         hyperedge_index = torch.cat(hyperedge_parts, dim=1)
     else:
@@ -131,6 +137,7 @@ def _batch_subgraphs(graphs: Sequence[Data]) -> Data:
         edge_index=hyperedge_index,
         y=y,
         batch=batch,
+        query_mask=query_mask,
         num_nodes=int(x.shape[0]),
         num_hyperedges=int(edge_offset),
     )
@@ -144,7 +151,7 @@ class PropagationSubgraphBuilder:
         hyperedge_index = _get_hyperedge_index(data).detach().cpu().long()
         self.hyperedge_index = hyperedge_index
         self.context_hops = max(int(getattr(args, "subgraph_context_hops", 1)), 1)
-        self.max_nodes = int(getattr(args, "subgraph_max_nodes", 64))
+        self.max_nodes = int(getattr(args, "subgraph_max_nodes", 0))
         self.max_hyperedges = int(getattr(args, "subgraph_max_hyperedges", 32))
 
         num_nodes = int(self.x.shape[0])
@@ -169,6 +176,13 @@ class PropagationSubgraphBuilder:
             if set(edge_nodes) == target
         }
 
+    def _edge_sort_key(self, edge_id: int, seed_set: set[int], frontier: set[int]) -> tuple[int, int, int, int]:
+        edge_node_set = set(self.edge_nodes[edge_id])
+        seed_overlap = len(edge_node_set.intersection(seed_set))
+        frontier_overlap = len(edge_node_set.intersection(frontier))
+        edge_size = len(edge_node_set)
+        return (-seed_overlap, -frontier_overlap, edge_size, edge_id)
+
     def _collect_ids(
         self,
         seed_nodes: Sequence[int],
@@ -179,8 +193,10 @@ class PropagationSubgraphBuilder:
             seed = [0]
 
         exclude_edge_ids = exclude_edge_ids or set()
-        visited_nodes = set(seed)
-        visited_edges: set[int] = set()
+        seed_set = set(seed)
+        selected_node_set = set(seed)
+        selected_edges: list[int] = []
+        selected_edge_set: set[int] = set()
         frontier = set(seed)
 
         for _ in range(self.context_hops):
@@ -188,33 +204,43 @@ class PropagationSubgraphBuilder:
             for node_id in frontier:
                 incident_edges.update(self.node_edges[node_id])
             incident_edges.difference_update(exclude_edge_ids)
+            incident_edges.difference_update(selected_edge_set)
             if not incident_edges:
                 break
 
-            visited_edges.update(incident_edges)
+            ranked_edges = sorted(
+                incident_edges,
+                key=lambda edge_id: self._edge_sort_key(edge_id, seed_set, frontier),
+            )
+            if self.max_hyperedges > 0:
+                remaining_edges = self.max_hyperedges - len(selected_edges)
+                if remaining_edges <= 0:
+                    break
+                ranked_edges = ranked_edges[:remaining_edges]
+            if not ranked_edges:
+                break
+
+            selected_edges.extend(ranked_edges)
+            selected_edge_set.update(ranked_edges)
+
             member_nodes: set[int] = set()
-            for edge_id in incident_edges:
+            for edge_id in ranked_edges:
                 member_nodes.update(self.edge_nodes[edge_id])
-            new_nodes = member_nodes.difference(visited_nodes)
-            visited_nodes.update(member_nodes)
+
+            new_nodes = member_nodes.difference(selected_node_set)
+            if self.max_nodes > 0:
+                remaining_nodes = self.max_nodes - len(selected_node_set)
+                if remaining_nodes <= 0:
+                    break
+                new_nodes = set(sorted(new_nodes)[:remaining_nodes])
+
+            selected_node_set.update(new_nodes)
             if not new_nodes:
                 break
             frontier = new_nodes
 
-        context_nodes = sorted(visited_nodes.difference(seed))
-        if self.max_nodes > 0:
-            context_budget = max(self.max_nodes - len(seed), 0)
-            context_nodes = context_nodes[:context_budget]
+        context_nodes = sorted(selected_node_set.difference(seed_set))
         selected_nodes = seed + context_nodes
-
-        selected_node_set = set(selected_nodes)
-        selected_edges = [
-            edge_id
-            for edge_id in sorted(visited_edges)
-            if any(node in selected_node_set for node in self.edge_nodes[edge_id])
-        ]
-        if self.max_hyperedges > 0:
-            selected_edges = selected_edges[: self.max_hyperedges]
         return selected_nodes, selected_edges
 
     def build_graph(
@@ -257,6 +283,7 @@ class PropagationSubgraphBuilder:
             hyperedge_index=hyperedge_index,
             edge_index=hyperedge_index,
             y=label,
+            query_mask=query_mask,
             num_nodes=int(x.shape[0]),
             num_hyperedges=int(local_edge_id),
         )

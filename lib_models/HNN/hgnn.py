@@ -142,14 +142,14 @@ class HypergraphConv(MessagePassing):
         return "{}({}, {})".format(self.__class__.__name__, self.in_channels,
                                    self.out_channels)
 
-class HCHA(nn.Module):
+class HGNN(nn.Module):
 
     def __init__(self, num_features, num_targets, args):
-        super(HCHA, self).__init__()
+        super(HGNN, self).__init__()
 
         self.num_layers = args.All_num_layers
         self.dropout = args.dropout  # Note that default is 0.6
-        self.symdegnorm = args.HCHA_symdegnorm
+        self.symdegnorm = args.HGNN_symdegnorm
         self.hidden_dim = args.MLP_hidden
 
 #       Note that add dropout to attention is default in the original paper

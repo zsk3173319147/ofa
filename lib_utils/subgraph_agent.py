@@ -12,18 +12,18 @@ import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, average_precision_score, f1_score, roc_auc_score
 from tqdm import tqdm
 
-from lib_dataset.edge_loaders import generate_edge_loaders, generate_ind_split_hyperedges, generate_split_hyperedges
+from lib_dataset.edge_loaders import (
+    edge_split_is_current,
+    generate_edge_loaders,
+    generate_ind_split_hyperedges,
+    generate_split_hyperedges,
+)
 from lib_dataset.hg_loaders import generate_hg_loaders, generate_split_hypergraphs
 from lib_models.HNN.preprocessing import algo_preprocessing
-from lib_utils.exp_agent import build_edge_prediction_graph, parse_model
 from lib_utils.metrics import avg_result_printer_edge, edge_evaluation_printer, hg_evaluation_printer
+from lib_utils.model_factory import build_edge_prediction_graph, parse_model
 from lib_utils.subgraph_model import SubgraphDownstreamModel
-from lib_utils.train_agent import (
-    freeze_encoder_if_linear_probe,
-    keep_encoder_eval_if_linear_probe,
-    load_pretrained_encoder_if_requested,
-)
-from lib_utils.utils import add_self_loop_hyperedges, fix_seed, mean_std_metrics, relabel_hyperedge_index, result_printer
+from lib_utils.utils import fix_seed, mean_std_metrics, result_printer
 from tasker import (
     GraphClsTaskAdapter,
     NodeClsSubgraphTaskAdapter,
@@ -36,13 +36,6 @@ from tasker import (
 
 
 def _prepare_hg_batch(batch, args):
-    if args.method in ["HyperND", "TFHNN", "HyperGCN", "SheafHyperGNN"]:
-        reindex_hyperedge_index, _ = relabel_hyperedge_index(batch.hyperedge_index)
-        batch.hyperedge_index = reindex_hyperedge_index
-        batch.edge_index = reindex_hyperedge_index
-        batch.hyperedge_index = add_self_loop_hyperedges(batch.hyperedge_index, batch.num_nodes)
-        batch.edge_index = batch.hyperedge_index
-
     batch = algo_preprocessing(batch, args)
 
     if args.method in ["AllSetformer"]:
@@ -52,27 +45,7 @@ def _prepare_hg_batch(batch, args):
 
 
 def _new_optimizer(model, args):
-    base_lr = float(getattr(args, "subgraph_lr", None) or args.lr)
-    base_wd = float(getattr(args, "subgraph_wd", None) if getattr(args, "subgraph_wd", None) is not None else args.wd)
-    encoder_lr = base_lr * float(getattr(args, "subgraph_encoder_lr_scale", 1.0))
-    head_lr = base_lr * float(getattr(args, "subgraph_head_lr_scale", 1.0))
-
-    encoder_params = []
-    head_params = []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if name.startswith("encoder."):
-            encoder_params.append(param)
-        else:
-            head_params.append(param)
-
-    param_groups = []
-    if encoder_params:
-        param_groups.append({"params": encoder_params, "lr": encoder_lr, "weight_decay": base_wd})
-    if head_params:
-        param_groups.append({"params": head_params, "lr": head_lr, "weight_decay": base_wd})
-    return torch.optim.Adam(param_groups, lr=base_lr, weight_decay=base_wd)
+    return torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
 
 
 class SubgraphExpAgent:
@@ -90,18 +63,11 @@ class SubgraphExpAgent:
         model_data = model_data_with_subgraph_schema(data, self.args)
         encoder = parse_model(self.args, model_data)
         model = SubgraphDownstreamModel(encoder, task_type, num_targets, self.args)
-        if self.args.method != "TMPHN":
-            model = model.to(self.device)
-        return model
+        return model.to(self.device)
 
     def _reset_and_prepare_model(self, model):
         model.reset_parameters()
-        load_pretrained_encoder_if_requested(model, self.args)
-        freeze_encoder_if_linear_probe(model, self.args)
         return _new_optimizer(model, self.args)
-
-    def _label_smoothing(self) -> float:
-        return max(float(getattr(self.args, "subgraph_label_smoothing", 0.0)), 0.0)
 
     def _use_best_model(self) -> bool:
         return bool(getattr(self.args, "early_stop", False)) or bool(getattr(self.args, "subgraph_use_best_model", False))
@@ -133,7 +99,6 @@ class SubgraphExpAgent:
 
     def _train_node_epoch(self, model, adapter, optimizer):
         model.train()
-        keep_encoder_eval_if_linear_probe(model, self.args)
         total_loss = 0.0
         steps = 0
 
@@ -141,7 +106,7 @@ class SubgraphExpAgent:
             batch = self._prepare_batch(batch)
             optimizer.zero_grad()
             logits = model(batch)
-            loss = F.cross_entropy(logits, batch.y.long(), label_smoothing=self._label_smoothing())
+            loss = F.cross_entropy(logits, batch.y.long())
             loss.backward()
             if self.args.clip_grad:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.clip_thresh)
@@ -246,7 +211,9 @@ class SubgraphExpAgent:
     def _ensure_edge_split(self, data, seed: int):
         split_file = self._edge_split_file(seed)
         if os.path.exists(split_file):
-            return
+            data_dict = torch.load(split_file, weights_only=False)
+            if edge_split_is_current(data_dict, self.args):
+                return
         os.makedirs(os.path.dirname(split_file), exist_ok=True)
         if self.args.edge_split_mode == "ind":
             generate_ind_split_hyperedges(data, self.args, seed)
@@ -263,7 +230,6 @@ class SubgraphExpAgent:
 
     def _train_edge_epoch(self, model, data, batch_loaders, optimizer):
         model.train()
-        keep_encoder_eval_if_linear_probe(model, self.args)
         total_loss = 0.0
         steps = 0
 
@@ -279,8 +245,6 @@ class SubgraphExpAgent:
             optimizer.zero_grad()
             logits = model(batch)
             targets = batch.y.float()
-            eps = min(self._label_smoothing(), 0.49)
-            targets = targets * (1.0 - 2.0 * eps) + eps
             loss = F.binary_cross_entropy_with_logits(logits, targets)
             loss.backward()
             if self.args.clip_grad:
@@ -408,7 +372,6 @@ class SubgraphExpAgent:
 
     def _train_hg_epoch(self, model, adapter, optimizer):
         model.train()
-        keep_encoder_eval_if_linear_probe(model, self.args)
         total_loss = 0.0
         steps = 0
 
@@ -418,11 +381,7 @@ class SubgraphExpAgent:
             batch = batch.to(self.device)
             optimizer.zero_grad()
             logits = model(batch)
-            loss = F.cross_entropy(
-                logits,
-                batch.y.view(-1).long(),
-                label_smoothing=self._label_smoothing(),
-            )
+            loss = F.cross_entropy(logits, batch.y.view(-1).long())
             loss.backward()
             if self.args.clip_grad:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.clip_thresh)

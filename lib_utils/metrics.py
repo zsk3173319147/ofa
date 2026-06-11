@@ -5,11 +5,6 @@ from torch import Tensor
 from sklearn.metrics import f1_score, roc_auc_score,average_precision_score,accuracy_score
 from collections import defaultdict
 from lib_models.HNN.preprocessing import algo_preprocessing
-from lib_utils.utils import relabel_hyperedge_index,add_self_loop_hyperedges
-try:
-    from ofa.tasker import PartialHyperedgeQuery
-except ModuleNotFoundError:
-    from tasker import PartialHyperedgeQuery
 
 def eval_acc(y_true, y_pred):
     acc_list = []
@@ -61,20 +56,6 @@ def test_hypegraph_loader(model,data_loader,args):
     with torch.no_grad():
 
         for batch in data_loader:
-            
-            if args.method in ['HyperND','TFHNN']:
-                model.encoder.cache=None 
-            elif args.method in ['HyperGCN']:
-                model.encoder.structure=None
-            elif args.method in ['SheafHyperGNN']:
-                model.encoder.hyperedge_attr=None 
-
-            if args.method in ['HyperND','TFHNN','HyperGCN','SheafHyperGNN']:
-                reindex_hyperedge_index,_ = relabel_hyperedge_index(batch.hyperedge_index)
-                batch.hyperedge_index = reindex_hyperedge_index
-                add_loop_hyperedge_index = add_self_loop_hyperedges(batch.hyperedge_index, batch.num_nodes)
-                batch.hyperedge_index = add_loop_hyperedge_index 
-            
             batch = algo_preprocessing(batch,args) 
 
             if args.method in ['AllSetformer']:
@@ -186,109 +167,6 @@ def evaluate_edge_loader(model, data, dataloader):
         test_labels = torch.cat(test_labels, dim=0)
 
     return test_preds.tolist(), test_labels.tolist()
-
-def score_hyperedges_with_fill_head(model, node_emb, hyperedges, device):
-    scores = []
-
-    for hyperedge in hyperedges:
-        nodes = torch.unique(hyperedge.to(device).long())
-        if nodes.numel() == 0:
-            scores.append(node_emb.new_tensor(0.0))
-            continue
-
-        contexts = []
-        candidate_rows = []
-        for node_pos in range(nodes.numel()):
-            keep = torch.ones(nodes.numel(), dtype=torch.bool, device=device)
-            keep[node_pos] = False
-            contexts.append(nodes[keep])
-            candidate_rows.append(nodes[node_pos].view(1))
-
-        query = PartialHyperedgeQuery(
-            contexts=contexts,
-            candidate_nodes=torch.stack(candidate_rows, dim=0),
-        )
-        logits = model.fill_head(node_emb, query).view(-1)
-        scores.append(logits.mean())
-
-    return torch.stack(scores, dim=0) if scores else node_emb.new_empty(0)
-
-def evaluate_fill_zero_shot_loader(model, data, dataloader, device):
-    model.eval()
-    test_preds, test_labels = [], []
-
-    with torch.no_grad():
-        node_emb, _ = model.encode(data)
-
-        while True:
-            hedges, labels, is_last = dataloader.next()
-            logits = score_hyperedges_with_fill_head(model, node_emb, hedges, device)
-            test_preds.append(torch.sigmoid(logits).detach().cpu())
-            test_labels.append(labels.detach().cpu())
-
-            if is_last:
-                break
-
-        test_preds = torch.cat(test_preds, dim=0)
-        test_labels = torch.cat(test_labels, dim=0)
-
-    return test_preds.tolist(), test_labels.tolist()
-
-def evaluate_edge_fill_zero_shot(model, data, batch_loaders, args):
-    train_metrics = eval_edge_fill_zero_shot_train(model, data, batch_loaders, args)
-    val_metrics = eval_edge_fill_zero_shot_val_test(model, data, batch_loaders, args, mode='val')
-    test_metrics = eval_edge_fill_zero_shot_val_test(model, data, batch_loaders, args, mode='test')
-    return train_metrics, val_metrics, test_metrics
-
-def eval_edge_fill_zero_shot_train(model, data, batch_loaders, args):
-    train_pred_pos, train_label_pos = evaluate_fill_zero_shot_loader(model, data, batch_loaders['train_pos'], args.device)
-    train_pred_neg, train_label_neg = evaluate_fill_zero_shot_loader(model, data, batch_loaders['train_neg'], args.device)
-
-    roc_train = roc_auc_score(np.array(train_label_pos+train_label_neg), np.array(train_pred_pos+train_pred_neg))
-    ap_train = average_precision_score(np.array(train_label_pos+train_label_neg), np.array(train_pred_pos+train_pred_neg))
-
-    metrics_dict={
-        'roc_train':roc_train,
-        'ap_train':ap_train
-    }
-
-    return metrics_dict
-
-def eval_edge_fill_zero_shot_val_test(model, data, batch_loaders, args, mode='val'):
-    val_pred_pos, val_label_pos = evaluate_fill_zero_shot_loader(model, data, batch_loaders[f'{mode}_pos'], args.device)
-    val_pred_sns, val_label_sns = evaluate_fill_zero_shot_loader(model, data, batch_loaders[f'{mode}_neg_sns'], args.device)
-    val_pred_mns, val_label_mns = evaluate_fill_zero_shot_loader(model, data, batch_loaders[f'{mode}_neg_mns'], args.device)
-    val_pred_cns, val_label_cns = evaluate_fill_zero_shot_loader(model, data, batch_loaders[f'{mode}_neg_cns'], args.device)
-
-    roc_sns = roc_auc_score(np.array(val_label_pos+val_label_sns), np.array(val_pred_pos+val_pred_sns))
-    ap_sns = average_precision_score(np.array(val_label_pos+val_label_sns),np.array(val_pred_pos+val_pred_sns))
-    roc_mns = roc_auc_score(np.array(val_label_pos+val_label_mns), np.array(val_pred_pos+val_pred_mns))
-    ap_mns = average_precision_score(np.array(val_label_pos+val_label_mns),np.array(val_pred_pos+val_pred_mns))
-    roc_cns = roc_auc_score(np.array(val_label_pos+val_label_cns), np.array(val_pred_pos+val_pred_cns))
-    ap_cns = average_precision_score(np.array(val_label_pos+val_label_cns),np.array(val_pred_pos+val_pred_cns))
-
-    val_pred_neg_mixed = val_pred_sns + val_pred_mns + val_pred_cns
-    val_label_neg_mixed = val_label_sns + val_label_mns + val_label_cns
-    roc_mixed = roc_auc_score(np.array(val_label_pos+val_label_neg_mixed), np.array(val_pred_pos+val_pred_neg_mixed))
-    ap_mixed = average_precision_score(np.array(val_label_pos+val_label_neg_mixed),np.array(val_pred_pos+val_pred_neg_mixed))
-
-    roc_average = (roc_sns+roc_mns+roc_cns+roc_mixed)/4
-    ap_average = (ap_sns+ap_mns+ap_cns+ap_mixed)/4
-
-    metrics_dict={
-        'roc_sns':roc_sns,
-        'ap_sns':ap_sns,
-        'roc_mns':roc_mns,
-        'ap_mns':ap_mns,
-        'roc_cns':roc_cns,
-        'ap_cns':ap_cns,
-        'roc_mixed':roc_mixed,
-        'ap_mixed':ap_mixed,
-        'roc_average':roc_average,
-        'ap_average':ap_average
-    }
-
-    return metrics_dict
 
 def eval_edge_train(model,data,batch_loaders):
     

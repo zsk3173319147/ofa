@@ -4,24 +4,55 @@ from collections import defaultdict
 import numpy as np
 import math
 
-def neg_generator(HE, pred_num):
-    # mns = MNSSampler(pred_num)
+def _edge_set(hyperedges):
+    return {frozenset(edge) for edge in hyperedges}
+
+
+def _sample_filtered_negatives(sampler, positive_hyperedges, pred_num, forbidden_hyperedges):
+    positive_hyperedges = _edge_set(positive_hyperedges)
+    forbidden_hyperedges = _edge_set(forbidden_hyperedges)
+    samples = []
+    seen = set()
+
+    attempts = 0
+    max_attempts = 20
+    while len(samples) < pred_num and attempts < max_attempts:
+        attempts += 1
+        for edge in sampler(set(positive_hyperedges)):
+            edge = frozenset(edge)
+            if edge in forbidden_hyperedges or edge in seen:
+                continue
+            samples.append(edge)
+            seen.add(edge)
+            if len(samples) >= pred_num:
+                break
+
+    if len(samples) < pred_num:
+        nodes = sorted(get_union(positive_hyperedges))
+        size_dist = list(generate_hyperedge_size_dist(positive_hyperedges).items())
+        vals = [v for v, _ in size_dist]
+        probs = [p for _, p in size_dist]
+        while len(samples) < pred_num and nodes:
+            sampled_size = int(np.random.choice(vals, p=probs))
+            edge = _random_non_positive_edge(nodes, sampled_size, forbidden_hyperedges.union(seen))
+            if edge in forbidden_hyperedges or edge in seen:
+                break
+            samples.append(edge)
+            seen.add(edge)
+
+    return [list(edge) for edge in samples]
+
+
+def neg_generator(HE, pred_num, forbidden_HE=None):
+    forbidden_HE = HE if forbidden_HE is None else forbidden_HE
     mns = MNSSampler(pred_num)
     sns = SNSSampler(pred_num)
     cns = CNSSampler(pred_num)
-    
-    t_mns = mns(set(HE))
-    t_sns = sns(set(HE))
-    t_cns = cns(set(HE))
-    
-    t_mns = list(t_mns)
-    t_sns = list(t_sns)
-    t_cns = list(t_cns)
-    
-    t_mns = [list(edge) for edge in t_mns]
-    t_sns = [list(edge) for edge in t_sns]
-    t_cns = [list(edge) for edge in t_cns]
-    
+
+    t_mns = _sample_filtered_negatives(mns, HE, pred_num, forbidden_HE)
+    t_sns = _sample_filtered_negatives(sns, HE, pred_num, forbidden_HE)
+    t_cns = _sample_filtered_negatives(cns, HE, pred_num, forbidden_HE)
+
     return t_mns, t_sns, t_cns
 
 def negative_sample(
