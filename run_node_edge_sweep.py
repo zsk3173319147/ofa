@@ -65,20 +65,20 @@ def add_common_args(cmd: list[str], args, task: str, pipeline: str) -> list[str]
         [
             "--device",
             args.device,
-            "--epochs",
-            str(args.epochs),
             "--num_seeds",
             str(args.num_seeds),
             "--display_step",
             str(args.display_step),
-            "--dropout",
-            str(args.dropout),
-            "--lr",
-            str(args.lr),
-            "--wd",
-            str(args.wd),
         ]
     )
+    for flag_name, value in (
+        ("--epochs", args.epochs),
+        ("--dropout", args.dropout),
+        ("--lr", args.lr),
+        ("--wd", args.wd),
+    ):
+        if value is not None:
+            cmd.extend([flag_name, str(value)])
 
     if task == "edge_pred":
         cmd.extend(
@@ -97,6 +97,10 @@ def add_common_args(cmd: list[str], args, task: str, pipeline: str) -> list[str]
     if pipeline == "subgraph":
         cmd.extend(
             [
+                "--lr",
+                str(args.subgraph_lr),
+                "--dropout",
+                str(args.subgraph_dropout),
                 "--subgraph_max_hyperedges",
                 str(args.subgraph_max_hyperedges),
                 "--subgraph_context_hops",
@@ -208,16 +212,18 @@ def main() -> int:
     parser.add_argument("--tasks", default="node_cls,edge_pred", help="Comma list from node_cls,edge_pred.")
     parser.add_argument("--pipelines", default="subgraph", help="Comma list from subgraph,baseline.")
     parser.add_argument("--device", default="cuda:2")
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=None, help="Default None means use lib_yamls config.")
     parser.add_argument("--num-seeds", "--num_seeds", dest="num_seeds", type=int, default=5)
     parser.add_argument("--display-step", "--display_step", dest="display_step", type=int, default=20)
-    parser.add_argument("--dropout", type=float, default=0.5)
-    parser.add_argument("--lr", type=float, default=0.001)
-    parser.add_argument("--wd", type=float, default=0.0)
+    parser.add_argument("--dropout", type=float, default=None, help="Default None means use lib_yamls config.")
+    parser.add_argument("--lr", type=float, default=None, help="Default None means use lib_yamls config.")
+    parser.add_argument("--wd", type=float, default=None, help="Default None means use lib_yamls config.")
     parser.add_argument("--edge-split-mode", "--edge_split_mode", dest="edge_split_mode", default="trand")
     parser.add_argument("--edge-batch-size", "--edge_batch_size", dest="edge_batch_size", type=int, default=512)
     parser.add_argument("--aggr-mode", "--aggr_mode", dest="aggr_mode", default="maxmin", choices=["max", "mean", "maxmin"])
     parser.add_argument("--ns-method", "--ns_method", dest="ns_method", default="mixed", choices=["mns", "sns", "cns", "mixed"])
+    parser.add_argument("--subgraph-lr", "--subgraph_lr", dest="subgraph_lr", type=float, default=0.0001)
+    parser.add_argument("--subgraph-dropout", "--subgraph_dropout", dest="subgraph_dropout", type=float, default=0.6)
     parser.add_argument("--subgraph-max-hyperedges", "--subgraph_max_hyperedges", dest="subgraph_max_hyperedges", type=int, default=8)
     parser.add_argument("--subgraph-context-hops", "--subgraph_context_hops", dest="subgraph_context_hops", type=int, default=1)
     parser.add_argument("--subgraph-batch-size", "--subgraph_batch_size", dest="subgraph_batch_size", type=int, default=256)

@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from lib_models.HNN import MLP
 from lib_utils.baseline_readout import MaxAggregator, MaxminAggregator, MeanAggregator
+from lib_utils.message_prompt import DualFlowMessagePrompt
 from tasker import TaskType
 
 
@@ -96,6 +97,23 @@ class SubgraphDownstreamModel(nn.Module):
         self.task_type = TaskType(task_type)
         self.readout = SubgraphReadout(args)
         self.edge_aggr = getattr(args, "edge_aggr", "group")
+        self.message_prompt = None
+        if bool(getattr(args, "use_message_prompt", False)):
+            if encoder.__class__.__name__ != "HGNN":
+                raise ValueError("Message prompt currently supports method=HGNN only.")
+            message_dims = [
+                int(getattr(conv, "heads", 1)) * int(getattr(conv, "out_channels"))
+                for conv in encoder.convs
+            ]
+            self.message_prompt = DualFlowMessagePrompt(
+                num_layers=int(getattr(args, "All_num_layers", 1)),
+                message_dims=message_dims,
+                rank=int(getattr(args, "message_prompt_rank", 16)),
+                residual_hidden_dim=int(getattr(args, "message_prompt_hidden_dim", 0)),
+                residual_init=float(getattr(args, "message_prompt_residual_init", 0.01)),
+                dropout=float(getattr(args, "message_prompt_dropout", 0.0)),
+            )
+            self.encoder.message_prompt = self.message_prompt
         self.head = self._build_head(num_targets, args)
 
     def _build_edge_aggregator(self, args) -> nn.Module:
@@ -139,10 +157,13 @@ class SubgraphDownstreamModel(nn.Module):
         if hasattr(self.encoder, "reset_parameters"):
             self.encoder.reset_parameters()
         self.readout.reset_parameters()
+        if self.message_prompt is not None:
+            self.message_prompt.reset_parameters()
+            self.encoder.message_prompt = self.message_prompt
         if hasattr(self.head, "reset_parameters"):
             self.head.reset_parameters()
 
-    def encode(self, data: Any) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def encode(self, data: Any, task_type: TaskType | str | None = None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         reset_dynamic_encoder_state(self.encoder)
         return split_encoder_output(self.encoder(data))
 
@@ -195,7 +216,7 @@ class SubgraphDownstreamModel(nn.Module):
         return torch.stack(scores, dim=0)
 
     def forward(self, batch) -> torch.Tensor:
-        node_emb, _ = self.encode(batch.h_prime)
+        node_emb, _ = self.encode(batch.h_prime, batch.task_type)
         if batch.task_type == TaskType.EDGE_PRED:
             return self._edge_scores(node_emb, batch.h_prime).view(-1)
         h_graph = self.readout(node_emb, batch.h_prime)

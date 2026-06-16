@@ -50,7 +50,10 @@ class HypergraphConv(MessagePassing):
         zeros(self.bias)
 
     def forward(self, x: Tensor, hyperedge_index: Tensor,
-                hyperedge_weight: Optional[Tensor] = None) -> Tensor:
+                hyperedge_weight: Optional[Tensor] = None,
+                message_prompter=None,
+                prompt_context=None,
+                layer_id: int = 0) -> Tensor:
         r"""
         Args:
             x (Tensor): Node feature matrix :math:`\mathbf{X}`
@@ -69,6 +72,11 @@ class HypergraphConv(MessagePassing):
             hyperedge_weight = x.new_ones(num_edges,device=x.device)
 
         x = torch.matmul(x, self.weight)
+        self._message_prompter = message_prompter
+        self._prompt_context = prompt_context
+        self._prompt_layer_id = layer_id
+        self._prompt_hyperedge_index = hyperedge_index
+        self._prompt_num_edges = num_edges
 
         alpha = None
         if self.use_attention:
@@ -136,6 +144,20 @@ class HypergraphConv(MessagePassing):
         if alpha is not None:
             out = alpha.view(-1, self.heads, 1) * out
 
+        if self._message_prompter is not None and self._prompt_context is not None:
+            node_ids = self._prompt_hyperedge_index[0].to(out.device)
+            edge_ids = self._prompt_hyperedge_index[1].to(out.device)
+            context = dict(self._prompt_context)
+            context["num_edges"] = self._prompt_num_edges
+            out = self._message_prompter(
+                out,
+                node_ids=node_ids,
+                edge_ids=edge_ids,
+                direction=self.flow,
+                layer_id=self._prompt_layer_id,
+                context=context,
+            )
+
         return out
 
     def __repr__(self):
@@ -154,6 +176,7 @@ class HGNN(nn.Module):
 
 #       Note that add dropout to attention is default in the original paper
         self.convs = nn.ModuleList()
+        self.message_prompt = None
         if self.num_layers == 1:
             self.convs.append(HypergraphConv(num_features,
                                num_targets, self.symdegnorm))
@@ -177,13 +200,27 @@ class HGNN(nn.Module):
 
         x = data.x
         edge_index = data.hyperedge_index
+        message_prompt = self.message_prompt
+        prompt_context = {} if message_prompt is not None else None
 
         for i, conv in enumerate(self.convs[:-1]):
-            x , e = conv(x,edge_index) 
+            x , e = conv(
+                x,
+                edge_index,
+                message_prompter=message_prompt,
+                prompt_context=prompt_context,
+                layer_id=i,
+            ) 
             x = F.elu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
 
-        x,e = self.convs[-1](x, edge_index)
+        x,e = self.convs[-1](
+            x,
+            edge_index,
+            message_prompter=message_prompt,
+            prompt_context=prompt_context,
+            layer_id=len(self.convs) - 1,
+        )
 
         return x,e
 

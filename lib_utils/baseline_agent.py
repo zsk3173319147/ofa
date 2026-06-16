@@ -19,6 +19,7 @@ from lib_dataset.edge_loaders import (
 from lib_dataset.hg_loaders import generate_hg_loaders, generate_split_hypergraphs
 from lib_models.HNN.preprocessing import algo_preprocessing
 from lib_utils.baseline_readout import EdgePredictor, HyperGPredictor, MaxAggregator, MaxminAggregator, MeanAggregator
+from lib_utils.few_shot import apply_few_shot_edge_split, apply_few_shot_node_split
 from lib_utils.metrics import (
     accuracy,
     aggr_metrics,
@@ -113,6 +114,7 @@ class BaselineExpAgent:
                 val_ratio=self.args.valid_prop,
                 seed=seed,
             )
+            masks = apply_few_shot_node_split(data, masks, self.args, seed)
 
             self.args.embedding_mode = False
             model = parse_model(self.args, data).to(self.device)
@@ -198,6 +200,7 @@ class BaselineExpAgent:
             fix_seed(seed)
             self._ensure_edge_split(data, seed)
             data_dict = torch.load(self._edge_split_file(seed), weights_only=False)
+            data_dict = apply_few_shot_edge_split(data_dict, self.args, seed)
             batch_loaders = generate_edge_loaders(data_dict, self.args)
             train_data = build_edge_prediction_graph(data, data_dict, self.args).to(self.device)
 

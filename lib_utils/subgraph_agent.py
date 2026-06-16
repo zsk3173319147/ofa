@@ -20,6 +20,7 @@ from lib_dataset.edge_loaders import (
 )
 from lib_dataset.hg_loaders import generate_hg_loaders, generate_split_hypergraphs
 from lib_models.HNN.preprocessing import algo_preprocessing
+from lib_utils.few_shot import apply_few_shot_edge_split, apply_few_shot_node_split
 from lib_utils.metrics import avg_result_printer_edge, edge_evaluation_printer, hg_evaluation_printer
 from lib_utils.model_factory import build_edge_prediction_graph, parse_model
 from lib_utils.subgraph_model import SubgraphDownstreamModel
@@ -45,7 +46,37 @@ def _prepare_hg_batch(batch, args):
 
 
 def _new_optimizer(model, args):
-    return torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    prompt = getattr(model, "message_prompt", None)
+    if prompt is None:
+        params = [param for param in model.parameters() if param.requires_grad]
+        return torch.optim.Adam(params, lr=args.lr, weight_decay=args.wd)
+
+    prompt_param_ids = {id(param) for param in prompt.parameters() if param.requires_grad}
+    base_params = []
+    prompt_params = []
+    seen = set()
+    for param in model.parameters():
+        if not param.requires_grad or id(param) in seen:
+            continue
+        seen.add(id(param))
+        if id(param) in prompt_param_ids:
+            prompt_params.append(param)
+        else:
+            base_params.append(param)
+
+    param_groups = []
+    if base_params:
+        param_groups.append({"params": base_params, "lr": args.lr, "weight_decay": args.wd})
+    if prompt_params:
+        prompt_wd = args.wd if float(getattr(args, "message_prompt_wd", -1.0)) < 0 else float(args.message_prompt_wd)
+        param_groups.append(
+            {
+                "params": prompt_params,
+                "lr": args.lr * float(getattr(args, "message_prompt_lr_scale", 1.0)),
+                "weight_decay": prompt_wd,
+            }
+        )
+    return torch.optim.Adam(param_groups)
 
 
 class SubgraphExpAgent:
@@ -57,6 +88,7 @@ class SubgraphExpAgent:
         self.train_times = []
         self.test_dict = defaultdict(list)
         self._subgraph_builders = {}
+        self._current_seed = None
 
     def _build_model(self, data, task_type: TaskType, num_targets: int):
         self.args.embedding_mode = True
@@ -67,7 +99,37 @@ class SubgraphExpAgent:
 
     def _reset_and_prepare_model(self, model):
         model.reset_parameters()
+        self._load_pretrained_encoder(model)
+        if bool(getattr(self.args, "freeze_encoder", False)):
+            for param in model.encoder.parameters():
+                param.requires_grad = False
+            if getattr(model, "message_prompt", None) is not None:
+                for param in model.message_prompt.parameters():
+                    param.requires_grad = True
         return _new_optimizer(model, self.args)
+
+    def _load_pretrained_encoder(self, model) -> None:
+        pretrain_path = getattr(self.args, "pretrain_path", "")
+        if not pretrain_path:
+            return
+        if self._current_seed is not None:
+            pretrain_path = pretrain_path.format(seed=int(self._current_seed))
+        checkpoint = torch.load(pretrain_path, map_location="cpu", weights_only=False)
+        state = checkpoint.get("encoder", checkpoint)
+        current = model.encoder.state_dict()
+        matched = {}
+        skipped = []
+        for key, value in state.items():
+            if key in current and tuple(current[key].shape) == tuple(value.shape):
+                matched[key] = value
+            else:
+                skipped.append(key)
+        missing, unexpected = model.encoder.load_state_dict(matched, strict=False)
+        print(
+            f"Loaded pretrained encoder from {pretrain_path}: "
+            f"matched={len(matched)}, skipped={len(skipped)}, "
+            f"missing={len(missing)}, unexpected={len(unexpected)}"
+        )
 
     def _use_best_model(self) -> bool:
         return bool(getattr(self.args, "early_stop", False)) or bool(getattr(self.args, "subgraph_use_best_model", False))
@@ -146,11 +208,13 @@ class SubgraphExpAgent:
 
         for seed in range(self.args.num_seeds):
             fix_seed(seed)
+            self._current_seed = seed
             masks = data.generate_random_split(
                 train_ratio=self.args.train_prop,
                 val_ratio=self.args.valid_prop,
                 seed=seed,
             )
+            masks = apply_few_shot_node_split(data, masks, self.args, seed)
             cache_start = time.time()
             builder = self._subgraph_builder(data)
             adapters = {
@@ -328,8 +392,10 @@ class SubgraphExpAgent:
 
         for seed in range(self.args.num_seeds):
             fix_seed(seed)
+            self._current_seed = seed
             self._ensure_edge_split(data, seed)
             data_dict = torch.load(self._edge_split_file(seed), weights_only=False)
+            data_dict = apply_few_shot_edge_split(data_dict, self.args, seed)
             batch_loaders = generate_edge_loaders(data_dict, self.args)
             train_data = build_edge_prediction_graph(data, data_dict, self.args)
 
@@ -424,6 +490,7 @@ class SubgraphExpAgent:
 
         for seed in range(self.args.num_seeds):
             fix_seed(seed)
+            self._current_seed = seed
             train_set, val_set, test_set = generate_split_hypergraphs(
                 data,
                 self.args.train_prop,

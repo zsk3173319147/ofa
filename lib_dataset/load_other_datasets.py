@@ -13,15 +13,18 @@ from torch_geometric.data import Data
 from torch_sparse import coalesce
 from sklearn.feature_extraction.text import CountVectorizer
 
+
+def _to_dense_array(features):
+    if hasattr(features, "todense"):
+        features = features.todense()
+    return np.asarray(features)
+
 def load_dataset(path='../hyperGCN/data/', dataset = 'cora', train_percent = 0.025):
     
     # first load node features:
     with open(osp.join(path, dataset, 'features.pickle'), 'rb') as f:
         features = pickle.load(f)
-        if dataset in ['actor','amazon','pokec','twitch']:
-            pass
-        else:
-            features = features.todense()
+        features = _to_dense_array(features)
 
     # then load node labels:
     with open(osp.join(path, dataset, 'labels.pickle'), 'rb') as f:
