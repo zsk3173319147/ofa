@@ -109,7 +109,6 @@ class SubgraphDownstreamModel(nn.Module):
                 num_layers=int(getattr(args, "All_num_layers", 1)),
                 message_dims=message_dims,
                 rank=int(getattr(args, "message_prompt_rank", 16)),
-                residual_hidden_dim=int(getattr(args, "message_prompt_hidden_dim", 0)),
                 residual_init=float(getattr(args, "message_prompt_residual_init", 0.01)),
                 dropout=float(getattr(args, "message_prompt_dropout", 0.0)),
             )

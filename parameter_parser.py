@@ -137,14 +137,16 @@ def parameter_parser():
     parser.add_argument('--mem_display_step',default=100)
     parser.add_argument('--display_step', type=int, default=20)
     parser.add_argument('--eval_verbose',default=True)
+
+    
     parser.add_argument('--subgraph_mode', default='propagation', choices=['propagation'])
     parser.add_argument('--subgraph_context_hops', default=1, type=int)
     parser.add_argument('--subgraph_max_nodes', default=0, type=int)
     parser.add_argument('--subgraph_max_hyperedges', default=8, type=int)
     parser.add_argument('--subgraph_batch_size', default=256, type=int)
     parser.add_argument('--subgraph_cache', default=True, type=str2bool)
-    parser.add_argument('--subgraph_add_role_features', default=True, type=str2bool)
-    parser.add_argument('--subgraph_role_dim', default=1, type=int)
+    parser.add_argument('--subgraph_add_role_features', default=False, type=str2bool)
+    parser.add_argument('--subgraph_role_dim', default=0, type=int)
     parser.add_argument('--subgraph_use_best_model', default=False, type=str2bool)
 
     parser.add_argument('--pretrain_save_dir', default='./pretrained', type=str)
@@ -165,14 +167,15 @@ def parameter_parser():
     parser.add_argument('--tricl_max_memberships', default=8192, type=int)
     parser.add_argument('--tricl_edge_split_seed', default=-1, type=int)
     parser.add_argument('--pretrain_path', default='', type=str)
+
+
     parser.add_argument('--freeze_encoder', default=False, type=str2bool)
     parser.add_argument('--use_message_prompt', default=False, type=str2bool)
     parser.add_argument('--message_prompt_rank', default=4, type=int)
-    parser.add_argument('--message_prompt_hidden_dim', default=0, type=int)
-    parser.add_argument('--message_prompt_residual_init', default=0.001, type=float)
+    parser.add_argument('--message_prompt_residual_init', default=0.1, type=float)
     parser.add_argument('--message_prompt_dropout', default=0.5, type=float)
     parser.add_argument('--message_prompt_lr_scale', default=0.1, type=float)
-    parser.add_argument('--message_prompt_wd', default=-1.0, type=float)
+    parser.add_argument('--message_prompt_wd', default=1.0, type=float)
     parser.add_argument('--few_shot_k', default=0, type=int)
     parser.add_argument('--few_shot_scope', default='total', choices=['total', 'per_class'])
     
