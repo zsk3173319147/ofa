@@ -51,9 +51,7 @@ class HypergraphConv(MessagePassing):
 
     def forward(self, x: Tensor, hyperedge_index: Tensor,
                 hyperedge_weight: Optional[Tensor] = None,
-                message_prompter=None,
-                prompt_context=None,
-                layer_id: int = 0) -> Tensor:
+                incidence_weight: Optional[Tensor] = None) -> Tensor:
         r"""
         Args:
             x (Tensor): Node feature matrix :math:`\mathbf{X}`
@@ -70,14 +68,12 @@ class HypergraphConv(MessagePassing):
 
         if hyperedge_weight is None:
             hyperedge_weight = x.new_ones(num_edges,device=x.device)
+        if incidence_weight is None:
+            incidence_weight = x.new_ones(hyperedge_index.size(1), device=x.device)
+        else:
+            incidence_weight = incidence_weight.to(device=x.device, dtype=x.dtype).view(-1)
 
         x = torch.matmul(x, self.weight)
-        self._message_prompter = message_prompter
-        self._prompt_context = prompt_context
-        self._prompt_layer_id = layer_id
-        self._prompt_hyperedge_index = hyperedge_index
-        self._prompt_num_edges = num_edges
-
         alpha = None
         if self.use_attention:
             assert num_edges <= num_edges
@@ -89,29 +85,32 @@ class HypergraphConv(MessagePassing):
             alpha = F.dropout(alpha, p=self.dropout, training=self.training)
 
         if not self.symdegnorm:
-            D = scatter_add(hyperedge_weight[hyperedge_index[1]],
+            D = scatter_add(hyperedge_weight[hyperedge_index[1]] * incidence_weight,
                             hyperedge_index[0], dim=0, dim_size=num_nodes)
             D = 1.0 / D
             D[D == float("inf")] = 0
 
-            B = scatter_add(x.new_ones(hyperedge_index.size(1),device=x.device),
+            B = scatter_add(incidence_weight,
                             hyperedge_index[1], dim=0, dim_size=num_edges)  
             B = 1.0 / B
             B[B == float("inf")] = 0
             
             self.flow = 'source_to_target'
             edge_embed = self.propagate(hyperedge_index, x=x, norm=B, alpha=alpha,
+                                 incidence_weight=incidence_weight,
                                  size=(num_nodes, num_edges))
             self.flow = 'target_to_source'
-            out = self.propagate(hyperedge_index, x=edge_embed, norm=D, alpha=alpha,size=(num_nodes, num_edges))
+            out = self.propagate(hyperedge_index, x=edge_embed, norm=D, alpha=alpha,
+                                 incidence_weight=incidence_weight,
+                                 size=(num_nodes, num_edges))
             
         else:  # this correspond to HGNN
-            D = scatter_add(hyperedge_weight[hyperedge_index[1]],
+            D = scatter_add(hyperedge_weight[hyperedge_index[1]] * incidence_weight,
                             hyperedge_index[0], dim=0, dim_size=num_nodes)
             D = 1.0 / D**(0.5)
             D[D == float("inf")] = 0
 
-            B = scatter_add(x.new_ones(hyperedge_index.size(1),device=x.device),
+            B = scatter_add(incidence_weight,
                             hyperedge_index[1], dim=0, dim_size=num_edges)
             B = 1.0 / B
             B[B == float("inf")] = 0
@@ -119,10 +118,13 @@ class HypergraphConv(MessagePassing):
             x = D.unsqueeze(-1)*x
             self.flow = 'source_to_target'
             edge_embed = self.propagate(hyperedge_index, x=x, norm=B, alpha=alpha,
+                                 incidence_weight=incidence_weight,
                                  size=(num_nodes, num_edges))
 
             self.flow = 'target_to_source'
-            out = self.propagate(hyperedge_index,x=edge_embed, norm=D, alpha=alpha,size=(num_nodes, num_edges))
+            out = self.propagate(hyperedge_index,x=edge_embed, norm=D, alpha=alpha,
+                                 incidence_weight=incidence_weight,
+                                 size=(num_nodes, num_edges))
 
         if self.concat is True:
             out = out.view(-1, self.heads * self.out_channels)
@@ -136,27 +138,13 @@ class HypergraphConv(MessagePassing):
 
         return out,edge_embed 
 
-    def message(self, x_j: Tensor, norm_i: Tensor, alpha: Tensor) -> Tensor:
+    def message(self, x_j: Tensor, norm_i: Tensor, alpha: Tensor, incidence_weight: Tensor) -> Tensor:
         H, F = self.heads, self.out_channels
         
-        out = norm_i.view(-1, 1, 1) * x_j.view(-1, H, F)
+        out = norm_i.view(-1, 1, 1) * incidence_weight.view(-1, 1, 1) * x_j.view(-1, H, F)
 
         if alpha is not None:
             out = alpha.view(-1, self.heads, 1) * out
-
-        if self._message_prompter is not None and self._prompt_context is not None:
-            node_ids = self._prompt_hyperedge_index[0].to(out.device)
-            edge_ids = self._prompt_hyperedge_index[1].to(out.device)
-            context = dict(self._prompt_context)
-            context["num_edges"] = self._prompt_num_edges
-            out = self._message_prompter(
-                out,
-                node_ids=node_ids,
-                edge_ids=edge_ids,
-                direction=self.flow,
-                layer_id=self._prompt_layer_id,
-                context=context,
-            )
 
         return out
 
@@ -176,7 +164,6 @@ class HGNN(nn.Module):
 
 #       Note that add dropout to attention is default in the original paper
         self.convs = nn.ModuleList()
-        self.message_prompt = None
         if self.num_layers == 1:
             self.convs.append(HypergraphConv(num_features,
                                num_targets, self.symdegnorm))
@@ -200,16 +187,13 @@ class HGNN(nn.Module):
 
         x = data.x
         edge_index = data.hyperedge_index
-        message_prompt = self.message_prompt
-        prompt_context = {} if message_prompt is not None else None
+        incidence_weight = getattr(data, "incidence_weight", None)
 
         for i, conv in enumerate(self.convs[:-1]):
             x , e = conv(
                 x,
                 edge_index,
-                message_prompter=message_prompt,
-                prompt_context=prompt_context,
-                layer_id=i,
+                incidence_weight=incidence_weight,
             ) 
             x = F.elu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
@@ -217,9 +201,7 @@ class HGNN(nn.Module):
         x,e = self.convs[-1](
             x,
             edge_index,
-            message_prompter=message_prompt,
-            prompt_context=prompt_context,
-            layer_id=len(self.convs) - 1,
+            incidence_weight=incidence_weight,
         )
 
         return x,e

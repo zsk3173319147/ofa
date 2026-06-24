@@ -81,11 +81,14 @@ def append_subgraph_role_features(
 
 
 def append_graph_batch_role_features(batch: Any, task_type: TaskType | str, args: Any) -> Any:
-    if subgraph_role_dim(args) <= 0:
-        return batch
     if not hasattr(batch, "x") or not isinstance(batch.x, torch.Tensor):
         return batch
     query_mask = torch.zeros(batch.x.shape[0], dtype=torch.bool, device=batch.x.device)
+    if TaskType(task_type) == TaskType.HG_CLS:
+        query_mask.fill_(True)
+    batch.query_mask = query_mask
+    if subgraph_role_dim(args) <= 0:
+        return batch
     batch.x = append_subgraph_role_features(batch.x, query_mask, task_type, args)
     return batch
 

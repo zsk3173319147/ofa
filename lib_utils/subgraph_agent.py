@@ -46,7 +46,7 @@ def _prepare_hg_batch(batch, args):
 
 
 def _new_optimizer(model, args):
-    prompt = getattr(model, "message_prompt", None)
+    prompt = getattr(model, "structural_prompt", None)
     if prompt is None:
         params = [param for param in model.parameters() if param.requires_grad]
         return torch.optim.Adam(params, lr=args.lr, weight_decay=args.wd)
@@ -68,11 +68,13 @@ def _new_optimizer(model, args):
     if base_params:
         param_groups.append({"params": base_params, "lr": args.lr, "weight_decay": args.wd})
     if prompt_params:
-        prompt_wd = args.wd if float(getattr(args, "message_prompt_wd", -1.0)) < 0 else float(args.message_prompt_wd)
+        prompt_lr_scale = float(getattr(args, "structural_prompt_lr_scale", 1.0))
+        prompt_wd_value = getattr(args, "structural_prompt_wd", -1.0)
+        prompt_wd = args.wd if float(prompt_wd_value) < 0 else float(prompt_wd_value)
         param_groups.append(
             {
                 "params": prompt_params,
-                "lr": args.lr * float(getattr(args, "message_prompt_lr_scale", 1.0)),
+                "lr": args.lr * prompt_lr_scale,
                 "weight_decay": prompt_wd,
             }
         )
@@ -103,8 +105,8 @@ class SubgraphExpAgent:
         if bool(getattr(self.args, "freeze_encoder", False)):
             for param in model.encoder.parameters():
                 param.requires_grad = False
-            if getattr(model, "message_prompt", None) is not None:
-                for param in model.message_prompt.parameters():
+            if getattr(model, "structural_prompt", None) is not None:
+                for param in model.structural_prompt.parameters():
                     param.requires_grad = True
         return _new_optimizer(model, self.args)
 

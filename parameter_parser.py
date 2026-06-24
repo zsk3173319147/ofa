@@ -142,7 +142,7 @@ def parameter_parser():
     parser.add_argument('--subgraph_mode', default='propagation', choices=['propagation'])
     parser.add_argument('--subgraph_context_hops', default=1, type=int)
     parser.add_argument('--subgraph_max_nodes', default=0, type=int)
-    parser.add_argument('--subgraph_max_hyperedges', default=8, type=int)
+    parser.add_argument('--subgraph_max_hyperedges', default=4, type=int)
     parser.add_argument('--subgraph_batch_size', default=256, type=int)
     parser.add_argument('--subgraph_cache', default=True, type=str2bool)
     parser.add_argument('--subgraph_add_role_features', default=False, type=str2bool)
@@ -170,12 +170,12 @@ def parameter_parser():
 
 
     parser.add_argument('--freeze_encoder', default=False, type=str2bool)
-    parser.add_argument('--use_message_prompt', default=False, type=str2bool)
-    parser.add_argument('--message_prompt_rank', default=4, type=int)
-    parser.add_argument('--message_prompt_residual_init', default=0.1, type=float)
-    parser.add_argument('--message_prompt_dropout', default=0.5, type=float)
-    parser.add_argument('--message_prompt_lr_scale', default=0.1, type=float)
-    parser.add_argument('--message_prompt_wd', default=1.0, type=float)
+    parser.add_argument('--use_structural_prompt', default=False, type=str2bool)
+    parser.add_argument('--structural_prompt_num_tokens', default=4, type=int)
+    parser.add_argument('--structural_prompt_temperature', default=1.0, type=float)
+    parser.add_argument('--structural_prompt_init_scale', default=0.001, type=float)
+    parser.add_argument('--structural_prompt_lr_scale', default=0.1, type=float)
+    parser.add_argument('--structural_prompt_wd', default=0.0, type=float)
     parser.add_argument('--few_shot_k', default=0, type=int)
     parser.add_argument('--few_shot_scope', default='total', choices=['total', 'per_class'])
     

@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from typing import Any, Optional
 
 import torch
 import torch.nn as nn
 
-from lib_models.HNN import MLP
-from lib_utils.baseline_readout import MaxAggregator, MaxminAggregator, MeanAggregator
-from lib_utils.message_prompt import DualFlowMessagePrompt
+from lib_utils.structural_prompt import LearnableHyperedgePromptBank
 from tasker import TaskType
 
 
@@ -96,69 +93,28 @@ class SubgraphDownstreamModel(nn.Module):
         self.encoder = encoder
         self.task_type = TaskType(task_type)
         self.readout = SubgraphReadout(args)
-        self.edge_aggr = getattr(args, "edge_aggr", "group")
-        self.message_prompt = None
-        if bool(getattr(args, "use_message_prompt", False)):
+        self.structural_prompt = None
+        prompt_tokens = int(getattr(args, "structural_prompt_num_tokens", 4))
+        if bool(getattr(args, "use_structural_prompt", False)) and prompt_tokens > 0:
             if encoder.__class__.__name__ != "HGNN":
-                raise ValueError("Message prompt currently supports method=HGNN only.")
-            message_dims = [
-                int(getattr(conv, "heads", 1)) * int(getattr(conv, "out_channels"))
-                for conv in encoder.convs
-            ]
-            self.message_prompt = DualFlowMessagePrompt(
-                num_layers=int(getattr(args, "All_num_layers", 1)),
-                message_dims=message_dims,
-                rank=int(getattr(args, "message_prompt_rank", 16)),
-                residual_init=float(getattr(args, "message_prompt_residual_init", 0.01)),
-                dropout=float(getattr(args, "message_prompt_dropout", 0.0)),
+                raise ValueError("Structural prompt currently supports method=HGNN only.")
+            self.structural_prompt = LearnableHyperedgePromptBank(
+                in_channels=int(getattr(encoder.convs[0], "in_channels")),
+                num_tokens=prompt_tokens,
+                temperature=float(getattr(args, "structural_prompt_temperature", 1.0)),
+                init_scale=float(getattr(args, "structural_prompt_init_scale", 0.02)),
             )
-            self.encoder.message_prompt = self.message_prompt
         self.head = self._build_head(num_targets, args)
 
-    def _build_edge_aggregator(self, args) -> nn.Module:
-        if args.aggr_mode == "maxmin":
-            return MaxminAggregator(args)
-        if args.aggr_mode == "mean":
-            return MeanAggregator(args)
-        if args.aggr_mode == "max":
-            return MaxAggregator(args)
-        raise ValueError(f"Unsupported edge aggregation mode: {args.aggr_mode}")
-
     def _build_head(self, num_targets: int, args) -> nn.Module:
-        in_channels = args.embedding_hidden
-        if self.task_type == TaskType.NODE_CLS:
-            return nn.Linear(in_channels, num_targets)
-
-        if self.task_type == TaskType.EDGE_PRED:
-            return self._build_edge_aggregator(args)
-        elif self.task_type == TaskType.HG_CLS:
-            hidden = args.g_embed_hidden
-            layers = args.g_embed_layer
-            dropout = args.g_embed_dropout
-            norm = args.g_embed_norm
-        else:
-            hidden = args.embedding_hidden
-            layers = 2
-            dropout = args.dropout
-            norm = "ln"
-
-        return MLP(
-            in_channels=in_channels,
-            hidden_channels=hidden,
-            out_channels=num_targets,
-            num_layers=layers,
-            dropout=dropout,
-            Normalization=norm,
-            InputNorm=False,
-        )
+        return nn.Linear(args.embedding_hidden, num_targets)
 
     def reset_parameters(self) -> None:
         if hasattr(self.encoder, "reset_parameters"):
             self.encoder.reset_parameters()
         self.readout.reset_parameters()
-        if self.message_prompt is not None:
-            self.message_prompt.reset_parameters()
-            self.encoder.message_prompt = self.message_prompt
+        if self.structural_prompt is not None:
+            self.structural_prompt.reset_parameters()
         if hasattr(self.head, "reset_parameters"):
             self.head.reset_parameters()
 
@@ -166,58 +122,13 @@ class SubgraphDownstreamModel(nn.Module):
         reset_dynamic_encoder_state(self.encoder)
         return split_encoder_output(self.encoder(data))
 
-    def _edge_scores(self, node_emb: torch.Tensor, data: Any) -> torch.Tensor:
-        if hasattr(data, "batch") and data.batch is not None:
-            batch = data.batch.to(node_emb.device).long()
-            graph_count = int(batch.max().item()) + 1 if batch.numel() else 1
-        else:
-            batch = torch.zeros(node_emb.shape[0], dtype=torch.long, device=node_emb.device)
-            graph_count = 1
-
-        if hasattr(data, "query_mask"):
-            query_mask = data.query_mask.to(node_emb.device).bool().view(-1)
-            if query_mask.numel() != node_emb.shape[0]:
-                query_mask = torch.ones(node_emb.shape[0], dtype=torch.bool, device=node_emb.device)
-        else:
-            query_mask = torch.ones(node_emb.shape[0], dtype=torch.bool, device=node_emb.device)
-
-        per_graph_embeddings = []
-        for graph_id in range(graph_count):
-            graph_mask = batch == graph_id
-            values = node_emb[graph_mask & query_mask]
-            if values.numel() == 0:
-                values = node_emb[graph_mask]
-            per_graph_embeddings.append(values)
-
-        if self.edge_aggr == "group":
-            grouped_embeddings = defaultdict(list)
-            grouped_ids = defaultdict(list)
-            for graph_id, embeddings in enumerate(per_graph_embeddings):
-                grouped_embeddings[int(embeddings.shape[0])].append(embeddings)
-                grouped_ids[int(embeddings.shape[0])].append(graph_id)
-
-            scores = node_emb.new_zeros((graph_count,))
-            for size, embeddings_list in grouped_embeddings.items():
-                if size == 0:
-                    continue
-                he_feats = torch.stack(embeddings_list, dim=0)
-                group_scores = self.head(he_feats, self.edge_aggr).view(-1)
-                graph_ids = torch.tensor(grouped_ids[size], dtype=torch.long, device=node_emb.device)
-                scores[graph_ids] = group_scores
-            return scores
-
-        scores = []
-        for embeddings in per_graph_embeddings:
-            if embeddings.numel() == 0:
-                scores.append(node_emb.new_zeros(()))
-            else:
-                scores.append(self.head(embeddings, self.edge_aggr).view(-1)[0])
-        return torch.stack(scores, dim=0)
-
     def forward(self, batch) -> torch.Tensor:
-        node_emb, _ = self.encode(batch.h_prime, batch.task_type)
+        h_prime = batch.h_prime
+        if self.structural_prompt is not None:
+            h_prime = self.structural_prompt(h_prime)
+        node_emb, _ = self.encode(h_prime, batch.task_type)
+        h_query = self.readout.query_pool(node_emb, h_prime)
+        out = self.head(h_query)
         if batch.task_type == TaskType.EDGE_PRED:
-            return self._edge_scores(node_emb, batch.h_prime).view(-1)
-        h_graph = self.readout(node_emb, batch.h_prime)
-        out = self.head(h_graph)
+            return out.view(-1)
         return out
