@@ -7,6 +7,7 @@ from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.utils import softmax
 from typing import Optional
 from lib_models.HNN.utils import zeros,glorot
+from lib_utils.message_prompt import TaskConditionedMessagePrompt
 
 class HypergraphConv(MessagePassing):
 
@@ -34,6 +35,8 @@ class HypergraphConv(MessagePassing):
             self.concat = True
             self.weight = nn.Parameter(torch.Tensor(in_channels, out_channels))
 
+        self.message_prompt = None
+        self.task_type = "node_cls"
         if bias and concat:
             self.bias = nn.Parameter(torch.Tensor(heads * out_channels))
         elif bias and not concat:
@@ -48,6 +51,12 @@ class HypergraphConv(MessagePassing):
         if self.use_attention:
             glorot(self.att)
         zeros(self.bias)
+        if self.message_prompt is not None and hasattr(self.message_prompt, "reset_parameters"):
+            self.message_prompt.reset_parameters()
+
+    def enable_message_prompt(self, rank: int, condition_mode: str = "task_direction"):
+        channels = int(self.heads * self.out_channels)
+        self.message_prompt = TaskConditionedMessagePrompt(channels, rank, condition_mode=condition_mode)
 
     def forward(self, x: Tensor, hyperedge_index: Tensor,
                 hyperedge_weight: Optional[Tensor] = None,
@@ -146,6 +155,9 @@ class HypergraphConv(MessagePassing):
         if alpha is not None:
             out = alpha.view(-1, self.heads, 1) * out
 
+        if self.message_prompt is not None:
+            out = self.message_prompt(out, task_type=self.task_type, direction=self.flow)
+
         return out
 
     def __repr__(self):
@@ -180,6 +192,17 @@ class HGNN(nn.Module):
     def reset_parameters(self):
         for conv in self.convs:
             conv.reset_parameters()
+
+    def enable_message_prompt(self, rank: int, condition_mode: str = "task_direction"):
+        for conv in self.convs:
+            if hasattr(conv, "enable_message_prompt"):
+                conv.enable_message_prompt(rank, condition_mode=condition_mode)
+
+    def set_task_type(self, task_type):
+        value = getattr(task_type, "value", task_type)
+        value = "node_cls" if value is None else str(value)
+        for conv in self.convs:
+            conv.task_type = value
 
     def forward(self, data):
 

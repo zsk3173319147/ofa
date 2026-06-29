@@ -5,7 +5,6 @@ from typing import Any, Optional
 import torch
 import torch.nn as nn
 
-from lib_utils.structural_prompt import LearnableHyperedgePromptBank
 from tasker import TaskType
 
 
@@ -93,16 +92,12 @@ class SubgraphDownstreamModel(nn.Module):
         self.encoder = encoder
         self.task_type = TaskType(task_type)
         self.readout = SubgraphReadout(args)
-        self.structural_prompt = None
-        prompt_tokens = int(getattr(args, "structural_prompt_num_tokens", 4))
-        if bool(getattr(args, "use_structural_prompt", False)) and prompt_tokens > 0:
+        if bool(getattr(args, "use_message_prompt", False)):
             if encoder.__class__.__name__ != "HGNN":
-                raise ValueError("Structural prompt currently supports method=HGNN only.")
-            self.structural_prompt = LearnableHyperedgePromptBank(
-                in_channels=int(getattr(encoder.convs[0], "in_channels")),
-                num_tokens=prompt_tokens,
-                temperature=float(getattr(args, "structural_prompt_temperature", 1.0)),
-                init_scale=float(getattr(args, "structural_prompt_init_scale", 0.02)),
+                raise ValueError("Message prompt currently supports method=HGNN only.")
+            encoder.enable_message_prompt(
+                int(getattr(args, "message_prompt_rank", 4)),
+                condition_mode=str(getattr(args, "message_prompt_condition", "task_direction")),
             )
         self.head = self._build_head(num_targets, args)
 
@@ -113,19 +108,17 @@ class SubgraphDownstreamModel(nn.Module):
         if hasattr(self.encoder, "reset_parameters"):
             self.encoder.reset_parameters()
         self.readout.reset_parameters()
-        if self.structural_prompt is not None:
-            self.structural_prompt.reset_parameters()
         if hasattr(self.head, "reset_parameters"):
             self.head.reset_parameters()
 
     def encode(self, data: Any, task_type: TaskType | str | None = None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         reset_dynamic_encoder_state(self.encoder)
+        if hasattr(self.encoder, "set_task_type"):
+            self.encoder.set_task_type(task_type or self.task_type)
         return split_encoder_output(self.encoder(data))
 
     def forward(self, batch) -> torch.Tensor:
         h_prime = batch.h_prime
-        if self.structural_prompt is not None:
-            h_prime = self.structural_prompt(h_prime)
         node_emb, _ = self.encode(h_prime, batch.task_type)
         h_query = self.readout.query_pool(node_emb, h_prime)
         out = self.head(h_query)

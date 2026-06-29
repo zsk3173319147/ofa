@@ -18,6 +18,27 @@ from tasker import PropagationSubgraphBuilder, TaskType, model_data_with_subgrap
 from tasker.subgraph_adapters import subgraph_role_dim
 
 
+TRICL_TAU_NODE = 0.5
+TRICL_TAU_GROUP = 0.5
+TRICL_TAU_MEMBERSHIP = 1.0
+TRICL_WEIGHT_GROUP = 1.0
+TRICL_WEIGHT_MEMBERSHIP = 1.0
+TRICL_MAX_CONTRAST_ITEMS = 2048
+TRICL_MAX_MEMBERSHIPS = 8192
+TRICL_RECIPE = {
+    "seed_mode": "mixed",
+    "tau_node": TRICL_TAU_NODE,
+    "tau_group": TRICL_TAU_GROUP,
+    "tau_membership": TRICL_TAU_MEMBERSHIP,
+    "weight_group": TRICL_WEIGHT_GROUP,
+    "weight_membership": TRICL_WEIGHT_MEMBERSHIP,
+    "proj_dim": "embedding_hidden",
+    "proj_dropout": 0.0,
+    "max_contrast_items": TRICL_MAX_CONTRAST_ITEMS,
+    "max_memberships": TRICL_MAX_MEMBERSHIPS,
+}
+
+
 def _prepare_hg_batch(batch: Data, args) -> Data:
     batch = algo_preprocessing(batch, args)
     if args.method in ["AllSetformer"]:
@@ -168,24 +189,21 @@ class TriCLBatchSeeds:
 
 def _sample_seeds(builder: PropagationSubgraphBuilder, args) -> TriCLBatchSeeds:
     batch_size = int(args.tricl_batch_size)
-    mode = str(args.tricl_seed_mode)
     num_nodes = int(builder.x.shape[0])
     edge_nodes = [nodes for nodes in builder.edge_nodes if len(nodes) > 0]
 
     seeds: list[list[int]] = []
-    if mode in ["node", "mixed"]:
-        node_count = batch_size if mode == "node" else batch_size // 2
-        node_ids = torch.randint(num_nodes, (node_count,)).tolist()
-        seeds.extend([[int(node_id)] for node_id in node_ids])
+    node_count = batch_size // 2
+    node_ids = torch.randint(num_nodes, (node_count,)).tolist()
+    seeds.extend([[int(node_id)] for node_id in node_ids])
 
-    if mode in ["edge", "mixed"]:
-        edge_count = batch_size - len(seeds)
-        if edge_nodes:
-            for _ in range(edge_count):
-                seeds.append([int(node) for node in random.choice(edge_nodes)])
-        else:
-            node_ids = torch.randint(num_nodes, (edge_count,)).tolist()
-            seeds.extend([[int(node_id)] for node_id in node_ids])
+    edge_count = batch_size - len(seeds)
+    if edge_nodes:
+        for _ in range(edge_count):
+            seeds.append([int(node) for node in random.choice(edge_nodes)])
+    else:
+        node_ids = torch.randint(num_nodes, (edge_count,)).tolist()
+        seeds.extend([[int(node_id)] for node_id in node_ids])
 
     labels = torch.zeros(len(seeds), dtype=torch.long)
     return TriCLBatchSeeds(seeds=seeds, labels=labels)
@@ -228,32 +246,32 @@ def tricl_loss(
     loss_node = _symmetric_info_nce(
         z1,
         z2,
-        float(args.tricl_tau_node),
-        max_items=int(args.tricl_max_contrast_items),
+        TRICL_TAU_NODE,
+        max_items=TRICL_MAX_CONTRAST_ITEMS,
     )
     loss_group = _symmetric_info_nce(
         y1,
         y2,
-        float(args.tricl_tau_group),
-        max_items=int(args.tricl_max_contrast_items),
+        TRICL_TAU_GROUP,
+        max_items=TRICL_MAX_CONTRAST_ITEMS,
     )
     loss_mem12 = _membership_loss(
         z1,
         y2,
         incidence,
-        float(args.tricl_tau_membership),
-        max_memberships=int(args.tricl_max_memberships),
+        TRICL_TAU_MEMBERSHIP,
+        max_memberships=TRICL_MAX_MEMBERSHIPS,
     )
     loss_mem21 = _membership_loss(
         z2,
         y1,
         incidence,
-        float(args.tricl_tau_membership),
-        max_memberships=int(args.tricl_max_memberships),
+        TRICL_TAU_MEMBERSHIP,
+        max_memberships=TRICL_MAX_MEMBERSHIPS,
     )
     loss_membership = 0.5 * (loss_mem12 + loss_mem21)
 
-    loss = loss_node + float(args.tricl_weight_group) * loss_group + float(args.tricl_weight_membership) * loss_membership
+    loss = loss_node + TRICL_WEIGHT_GROUP * loss_group + TRICL_WEIGHT_MEMBERSHIP * loss_membership
     metrics = {
         "loss_node": float(loss_node.detach().cpu()),
         "loss_group": float(loss_group.detach().cpu()),
@@ -275,8 +293,8 @@ class TriCLPretrainAgent:
         model = TriCLPretrainModel(
             encoder,
             hidden_dim=int(self.args.embedding_hidden),
-            proj_dim=int(self.args.tricl_proj_dim),
-            dropout=float(self.args.tricl_proj_dropout),
+            proj_dim=int(self.args.embedding_hidden),
+            dropout=0.0,
         )
         return model.to(self.device)
 
@@ -332,9 +350,8 @@ class TriCLPretrainAgent:
                 best_loss = epoch_metrics["loss"]
                 best_state = {
                     "encoder": model.encoder.state_dict(),
-                    "node_projection": model.node_projection.state_dict(),
-                    "edge_projection": model.edge_projection.state_dict(),
                     "args": vars(self.args).copy(),
+                    "tricl_recipe": TRICL_RECIPE,
                     "epoch": epoch,
                     "loss": best_loss,
                 }
@@ -350,7 +367,11 @@ class TriCLPretrainAgent:
 
         checkpoint = self._checkpoint_path()
         os.makedirs(os.path.dirname(checkpoint), exist_ok=True)
-        torch.save(best_state or {"encoder": model.encoder.state_dict(), "args": vars(self.args).copy()}, checkpoint)
+        torch.save(
+            best_state
+            or {"encoder": model.encoder.state_dict(), "args": vars(self.args).copy(), "tricl_recipe": TRICL_RECIPE},
+            checkpoint,
+        )
         print(f"Training Time: {time.time() - start_time:.2f}")
         print(f"Saved TriCL encoder checkpoint: {checkpoint}")
         return checkpoint
