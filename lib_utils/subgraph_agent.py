@@ -17,10 +17,11 @@ from lib_dataset.edge_loaders import (
     generate_edge_loaders,
     generate_ind_split_hyperedges,
     generate_split_hyperedges,
+    split_positive_hyperedges,
 )
 from lib_dataset.hg_loaders import generate_hg_loaders, generate_split_hypergraphs
 from lib_models.HNN.preprocessing import algo_preprocessing
-from lib_utils.few_shot import apply_few_shot_edge_split, apply_few_shot_node_split
+from lib_utils.few_shot import apply_few_shot_edge_split, apply_few_shot_hg_split, apply_few_shot_node_split
 from lib_utils.metrics import avg_result_printer_edge, edge_evaluation_printer, hg_evaluation_printer
 from lib_utils.model_factory import build_edge_prediction_graph, parse_model
 from lib_utils.subgraph_model import SubgraphDownstreamModel
@@ -30,6 +31,7 @@ from tasker import (
     NodeClsSubgraphTaskAdapter,
     PropagationSubgraphBuilder,
     TaskType,
+    TaskBatchDataset,
     append_graph_batch_role_features,
     build_edge_subgraph_task_batch,
     model_data_with_subgraph_schema,
@@ -45,40 +47,9 @@ def _prepare_hg_batch(batch, args):
     return batch
 
 
-def _is_message_prompt_param(name: str) -> bool:
-    return ".message_prompt." in name
-
-
 def _new_optimizer(model, args):
-    prompt_param_names = {
-        name for name, param in model.named_parameters()
-        if param.requires_grad and _is_message_prompt_param(name)
-    }
-    if not prompt_param_names:
-        params = [param for param in model.parameters() if param.requires_grad]
-        return torch.optim.Adam(params, lr=args.lr, weight_decay=args.wd)
-
-    base_params = []
-    prompt_params = []
-    seen = set()
-    for name, param in model.named_parameters():
-        if not param.requires_grad or id(param) in seen:
-            continue
-        seen.add(id(param))
-        if name in prompt_param_names:
-            prompt_params.append(param)
-        else:
-            base_params.append(param)
-
-    param_groups = []
-    if base_params:
-        param_groups.append({"params": base_params, "lr": args.lr, "weight_decay": args.wd})
-    if prompt_params:
-        prompt_lr = float(getattr(args, "message_prompt_lr", args.lr))
-        prompt_wd_value = getattr(args, "message_prompt_wd", -1.0)
-        prompt_wd = args.wd if float(prompt_wd_value) < 0 else float(prompt_wd_value)
-        param_groups.append({"params": prompt_params, "lr": prompt_lr, "weight_decay": prompt_wd})
-    return torch.optim.Adam(param_groups)
+    params = [param for param in model.parameters() if param.requires_grad]
+    return torch.optim.Adam(params, lr=args.lr, weight_decay=args.wd)
 
 
 class SubgraphExpAgent:
@@ -101,40 +72,45 @@ class SubgraphExpAgent:
 
     def _reset_and_prepare_model(self, model):
         model.reset_parameters()
-        self._load_pretrained_encoder(model)
-        if bool(getattr(self.args, "freeze_encoder", False)):
-            for param in model.encoder.parameters():
-                param.requires_grad = False
-            for name, param in model.named_parameters():
-                if _is_message_prompt_param(name):
-                    param.requires_grad = True
         return _new_optimizer(model, self.args)
-
-    def _load_pretrained_encoder(self, model) -> None:
-        pretrain_path = getattr(self.args, "pretrain_path", "")
-        if not pretrain_path:
-            return
-        if self._current_seed is not None:
-            pretrain_path = pretrain_path.format(seed=int(self._current_seed))
-        checkpoint = torch.load(pretrain_path, map_location="cpu", weights_only=False)
-        state = checkpoint.get("encoder", checkpoint)
-        current = model.encoder.state_dict()
-        matched = {}
-        skipped = []
-        for key, value in state.items():
-            if key in current and tuple(current[key].shape) == tuple(value.shape):
-                matched[key] = value
-            else:
-                skipped.append(key)
-        missing, unexpected = model.encoder.load_state_dict(matched, strict=False)
-        print(
-            f"Loaded pretrained encoder from {pretrain_path}: "
-            f"matched={len(matched)}, skipped={len(skipped)}, "
-            f"missing={len(missing)}, unexpected={len(unexpected)}"
-        )
 
     def _use_best_model(self) -> bool:
         return bool(getattr(self.args, "early_stop", False)) or bool(getattr(self.args, "subgraph_use_best_model", False))
+
+    def _save_downstream_model(self, model, task_type: TaskType | str, seed: int) -> None:
+        save_path = str(getattr(self.args, "downstream_save_path", "") or "")
+        if not save_path:
+            return
+
+        task_value = getattr(task_type, "value", task_type)
+        task_value = str(task_value)
+        if not os.path.splitext(save_path)[1]:
+            save_path = os.path.join(
+                save_path,
+                f"{self.args.dname}_{task_value}_{self.args.method}_seed{seed}.pt",
+            )
+        else:
+            save_path = save_path.format(
+                dname=self.args.dname,
+                task_type=task_value,
+                method=self.args.method,
+                seed=seed,
+            )
+
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "encoder": model.encoder.state_dict(),
+                "args": vars(self.args).copy(),
+                "task_type": task_value,
+                "dname": self.args.dname,
+                "method": self.args.method,
+                "seed": int(seed),
+            },
+            save_path,
+        )
+        print(f"Saved downstream checkpoint: {save_path}")
 
     def _prepare_batch(self, batch):
         if not bool(getattr(batch.h_prime, "_subgraph_prepared", False)):
@@ -261,6 +237,7 @@ class SubgraphExpAgent:
             print(f"------------------------------[Seed {seed}]-----------------------------------")
             print(f"train_acc: {result[0]:.2f}, valid_acc: {result[1]:.2f}, test_acc: {result[2]:.2f}")
             print(f"------------------------------------------------------------------------------")
+            self._save_downstream_model(eval_model, TaskType.NODE_CLS, seed)
             metrics_dict["acc"].append(result)
 
         print(f"---------------------------------[Final]--------------------------------------")
@@ -293,6 +270,86 @@ class SubgraphExpAgent:
         batch = build_edge_subgraph_task_batch(builder, hyperedges, labels)
         batch.h_prime = _prepare_hg_batch(batch.h_prime, self.args)
         return batch.to(self.device)
+
+    def build_node_train_dataset(
+        self,
+        data,
+        seed: int,
+        source_name: Optional[str] = None,
+    ) -> TaskBatchDataset:
+        fix_seed(seed)
+        masks = data.generate_random_split(
+            train_ratio=self.args.train_prop,
+            val_ratio=self.args.valid_prop,
+            seed=seed,
+        )
+        masks = apply_few_shot_node_split(data, masks, self.args, seed)
+        builder = self._subgraph_builder(data)
+        adapter = self._node_adapter(data, masks, split="train", shuffle=False, builder=builder)
+        batches = list(adapter)
+        sample_count = sum(int(batch.y.numel()) for batch in batches)
+        return TaskBatchDataset(
+            name=source_name or f"{self.args.dname}:node_cls",
+            task_type=TaskType.NODE_CLS,
+            batches=batches,
+            metadata={
+                "samples": sample_count,
+                "dname": self.args.dname,
+            },
+        )
+
+    def _edge_train_negative_hyperedges(self, data_dict):
+        if self.args.ns_method == "mixed":
+            d = len(data_dict["train_sns"]) // 3
+            return data_dict["train_sns"][:d] + data_dict["train_mns"][:d] + data_dict["train_cns"][:d]
+        return data_dict[f"train_{self.args.ns_method}"]
+
+    def _edge_train_task_batches(self, data, data_dict) -> list:
+        pos_hyperedges = list(split_positive_hyperedges(data_dict, "train"))
+        neg_hyperedges = list(self._edge_train_negative_hyperedges(data_dict))
+        batch_size = max(2, int(getattr(self.args, "edge_batch_size", 512)))
+        half_batch = max(1, batch_size // 2)
+        num_steps = max(
+            (len(pos_hyperedges) + half_batch - 1) // half_batch,
+            (len(neg_hyperedges) + half_batch - 1) // half_batch,
+        )
+
+        batches = []
+        builder = self._subgraph_builder(data)
+        for step in range(num_steps):
+            pos_part = pos_hyperedges[step * half_batch : (step + 1) * half_batch]
+            neg_part = neg_hyperedges[step * half_batch : (step + 1) * half_batch]
+            if not pos_part and not neg_part:
+                continue
+            hyperedges = pos_part + neg_part
+            labels = torch.tensor([1] * len(pos_part) + [0] * len(neg_part), dtype=torch.long)
+            batches.append(build_edge_subgraph_task_batch(builder, hyperedges, labels))
+        return batches
+
+    def build_edge_train_dataset(
+        self,
+        data,
+        seed: int,
+        source_name: Optional[str] = None,
+    ) -> TaskBatchDataset:
+        fix_seed(seed)
+        self._ensure_edge_split(data, seed)
+        data_dict = torch.load(self._edge_split_file(seed), weights_only=False)
+        data_dict = apply_few_shot_edge_split(data_dict, self.args, seed)
+        train_data = build_edge_prediction_graph(data, data_dict, self.args)
+        batches = self._edge_train_task_batches(train_data, data_dict)
+        sample_count = sum(int(batch.y.numel()) for batch in batches)
+        return TaskBatchDataset(
+            name=source_name or f"{self.args.dname}:edge_pred",
+            task_type=TaskType.EDGE_PRED,
+            batches=batches,
+            metadata={
+                "samples": sample_count,
+                "dname": self.args.dname,
+                "edge_split_mode": self.args.edge_split_mode,
+                "ns_method": self.args.ns_method,
+            },
+        )
 
     def _train_edge_epoch(self, model, data, batch_loaders, optimizer):
         model.train()
@@ -426,6 +483,7 @@ class SubgraphExpAgent:
             print(f"------------------------------[Seed {seed}]-----------------------------------")
             edge_evaluation_printer(train_metrics, val_metrics, test_metrics)
             print(f"------------------------------------------------------------------------------")
+            self._save_downstream_model(eval_model, TaskType.EDGE_PRED, seed)
 
             for key, value in train_metrics.items():
                 metrics_dict["train"][key].append(value)
@@ -499,6 +557,7 @@ class SubgraphExpAgent:
                 self.args.valid_prop,
                 seed,
             )
+            train_set = apply_few_shot_hg_split(train_set, self.args, seed)
             batch_loaders = generate_hg_loaders(train_set, val_set, test_set, self.args)
 
             model = self._build_model(data, TaskType.HG_CLS, data.num_classes)
@@ -526,6 +585,7 @@ class SubgraphExpAgent:
             print(f"------------------------------[Seed {seed}]-----------------------------------")
             hg_evaluation_printer(result)
             print(f"------------------------------------------------------------------------------")
+            self._save_downstream_model(eval_model, TaskType.HG_CLS, seed)
 
             for metric_name, values in result.items():
                 metrics_dict[metric_name].append(values)

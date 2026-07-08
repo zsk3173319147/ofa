@@ -4,54 +4,47 @@ sys.path.insert(0, str(Path(__file__).parent / 'dhgbench'))
 from lib_utils.parallel_config import configure_cpu_parallelism
 configure_cpu_parallelism()
 from lib_utils.baseline_agent import BaselineExpAgent
+from lib_utils.multitask_agent import MultiTaskExpAgent
 from lib_utils.subgraph_agent import SubgraphExpAgent
 from lib_models.HNN.preprocessing import algo_preprocessing
 from lib_dataset.data_base import HyperDataset
 from lib_dataset.preprocessing import data_processing
 from parameter_parser import parameter_parser,method_config,set_task_args
-from lib_dataset.data_perturbation import perturbation
 
 if __name__ == '__main__':
 
     args = parameter_parser() 
-    args = method_config(args) 
-    args = set_task_args(args) 
-
-    data=HyperDataset(args) 
-
-    if args.task_type == 'hg_cls':
-        data = data.multi_hypergraphs 
+    args = method_config(args)
+    if args.pipeline == 'multitask':
+        args.embedding_mode = False
+        args.add_self_loop = False
+        if args.use_bench_prop:
+            args.train_prop, args.valid_prop = 0.6, 0.2
+        # Multi-task validation scores mix different metrics and can prefer one task over another.
+        # Use the final checkpoint by default for fair task comparison.
+        args.early_stop = False
     else:
-        data = data_processing(args,data)
-        data._initialization_()
+        args = set_task_args(args) 
 
-        if args.is_perturbed:
-            if isinstance(args.pert_p,str):
-                args.pert_p = eval(args.pert_p)
-            if args.pert_mode not in ['spar_label','flip_label']:
-                print('Robustness Perturbation for Structure and Feature')
-                if args.is_poison:
-                    print('Performing Poison Attack!')
-                    data = perturbation(data,mode=args.pert_mode,p=args.pert_p,masks=None)
-                else:
-                    print('Performing Evasion Attack!')
-                    evasion_data = perturbation(data,mode=args.pert_mode,p=args.pert_p,masks=None)
-            else:
-                print('Robustness Perturbation for Supervision Signal')
-                if args.is_poison == False:
-                    raise ValueError('Label attack is expected to be the poison attack!')
+    data = None
+    if args.pipeline != 'multitask':
+        data=HyperDataset(args) 
 
-        if args.task_type != 'edge_pred':
-            data = algo_preprocessing(data,args)
+        if args.task_type == 'hg_cls':
+            data = data.multi_hypergraphs 
+        else:
+            data = data_processing(args,data)
+            data._initialization_()
 
-        if args.is_perturbed and not args.is_poison:
-            evasion_data = algo_preprocessing(evasion_data,args)
-            data.evasion_data = evasion_data # store evasion data
+            if args.task_type != 'edge_pred':
+                data = algo_preprocessing(data,args)
     
     if args.pipeline == 'baseline':
         agent = BaselineExpAgent(args)
     elif args.pipeline == 'subgraph':
         agent = SubgraphExpAgent(args)
+    elif args.pipeline == 'multitask':
+        agent = MultiTaskExpAgent(args)
     else:
         raise ValueError(f'Unsupported pipeline: {args.pipeline}')
     agent.running(args.task_type,data)

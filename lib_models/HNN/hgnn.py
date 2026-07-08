@@ -5,9 +5,61 @@ from torch import Tensor
 from torch_scatter import scatter_add
 from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.utils import softmax
-from typing import Optional
+from typing import Any, Optional
 from lib_models.HNN.utils import zeros,glorot
-from lib_utils.message_prompt import TaskConditionedMessagePrompt
+
+
+class TaskLayerAdapter(nn.Module):
+    """Task-conditioned bottleneck adapter applied after each HGNN layer."""
+
+    TASK_TO_ID = {
+        "node_cls": 0,
+        "edge_pred": 1,
+        "hg_cls": 2,
+    }
+
+    def __init__(self, channels: int, hidden_dim: int = 16) -> None:
+        super().__init__()
+        self.channels = int(channels)
+        hidden_dim = int(hidden_dim)
+        self.bottleneck_dim = hidden_dim if hidden_dim > 0 else max(8, self.channels // 8)
+        self.condition_dim = max(16, self.channels // 4)
+        self.task_embeddings = nn.Embedding(len(self.TASK_TO_ID), self.condition_dim)
+        self.down_hypernet = nn.Linear(self.condition_dim, self.channels * self.bottleneck_dim)
+        self.up_hypernet = nn.Linear(self.condition_dim, self.bottleneck_dim * self.channels)
+        self.norms = nn.ModuleList([nn.LayerNorm(self.channels) for _ in self.TASK_TO_ID])
+        self.residual_scales = nn.Parameter(torch.empty(len(self.TASK_TO_ID)))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.task_embeddings.weight, std=0.02)
+        nn.init.normal_(self.down_hypernet.weight, std=0.02)
+        nn.init.zeros_(self.down_hypernet.bias)
+        nn.init.zeros_(self.up_hypernet.weight)
+        nn.init.zeros_(self.up_hypernet.bias)
+        nn.init.constant_(self.residual_scales, 0.1)
+        for norm in self.norms:
+            norm.reset_parameters()
+
+    @classmethod
+    def _task_id(cls, task_type: Any) -> int:
+        value = getattr(task_type, "value", task_type)
+        value = "node_cls" if value is None else str(value)
+        if value.startswith("TaskType."):
+            value = value.split(".", 1)[1].lower()
+        return cls.TASK_TO_ID.get(value, cls.TASK_TO_ID["node_cls"])
+
+    def forward(self, x: Tensor, task_type: Any) -> Tensor:
+        task_id = self._task_id(task_type)
+        task_tensor = torch.tensor(task_id, dtype=torch.long, device=x.device)
+        condition = self.task_embeddings(task_tensor)
+        down = self.down_hypernet(condition).view(self.channels, self.bottleneck_dim)
+        up = self.up_hypernet(condition).view(self.bottleneck_dim, self.channels)
+        flat = x.reshape(-1, self.channels)
+        delta = F.gelu(flat.matmul(down)).matmul(up)
+        delta = self.norms[task_id](delta).view_as(x)
+        scale = self.residual_scales[task_id].to(device=x.device, dtype=x.dtype)
+        return x + scale * delta
 
 class HypergraphConv(MessagePassing):
 
@@ -35,8 +87,6 @@ class HypergraphConv(MessagePassing):
             self.concat = True
             self.weight = nn.Parameter(torch.Tensor(in_channels, out_channels))
 
-        self.message_prompt = None
-        self.task_type = "node_cls"
         if bias and concat:
             self.bias = nn.Parameter(torch.Tensor(heads * out_channels))
         elif bias and not concat:
@@ -45,18 +95,14 @@ class HypergraphConv(MessagePassing):
             self.register_parameter('bias', None)
 
         self.reset_parameters()
+        self.layer_id = 0
 
     def reset_parameters(self):
         glorot(self.weight)
         if self.use_attention:
             glorot(self.att)
         zeros(self.bias)
-        if self.message_prompt is not None and hasattr(self.message_prompt, "reset_parameters"):
-            self.message_prompt.reset_parameters()
 
-    def enable_message_prompt(self, rank: int, condition_mode: str = "task_direction"):
-        channels = int(self.heads * self.out_channels)
-        self.message_prompt = TaskConditionedMessagePrompt(channels, rank, condition_mode=condition_mode)
 
     def forward(self, x: Tensor, hyperedge_index: Tensor,
                 hyperedge_weight: Optional[Tensor] = None,
@@ -154,10 +200,6 @@ class HypergraphConv(MessagePassing):
 
         if alpha is not None:
             out = alpha.view(-1, self.heads, 1) * out
-
-        if self.message_prompt is not None:
-            out = self.message_prompt(out, task_type=self.task_type, direction=self.flow)
-
         return out
 
     def __repr__(self):
@@ -189,20 +231,30 @@ class HGNN(nn.Module):
             self.convs.append(HypergraphConv(
                 self.hidden_dim, num_targets, self.symdegnorm))
 
+        self.task_type = "node_cls"
+        self.adapters = nn.ModuleList()
+        self.use_adapter = False
+
     def reset_parameters(self):
         for conv in self.convs:
             conv.reset_parameters()
+        for adapter in self.adapters:
+            adapter.reset_parameters()
 
-    def enable_message_prompt(self, rank: int, condition_mode: str = "task_direction"):
-        for conv in self.convs:
-            if hasattr(conv, "enable_message_prompt"):
-                conv.enable_message_prompt(rank, condition_mode=condition_mode)
+    def enable_adapter(self, hidden_dim: int = 16):
+        self.use_adapter = True
+        self.adapters = nn.ModuleList(
+            [TaskLayerAdapter(int(conv.heads * conv.out_channels), hidden_dim) for conv in self.convs]
+        )
 
     def set_task_type(self, task_type):
         value = getattr(task_type, "value", task_type)
-        value = "node_cls" if value is None else str(value)
-        for conv in self.convs:
-            conv.task_type = value
+        self.task_type = "node_cls" if value is None else str(value)
+
+    def _apply_adapter(self, layer_id: int, x: Tensor) -> Tensor:
+        if not self.use_adapter or layer_id >= len(self.adapters):
+            return x
+        return self.adapters[layer_id](x, self.task_type)
 
     def forward(self, data):
 
@@ -217,7 +269,8 @@ class HGNN(nn.Module):
                 x,
                 edge_index,
                 incidence_weight=incidence_weight,
-            ) 
+            )
+            x = self._apply_adapter(i, x)
             x = F.elu(x)
             x = F.dropout(x, p=self.dropout, training=self.training)
 
@@ -226,6 +279,7 @@ class HGNN(nn.Module):
             edge_index,
             incidence_weight=incidence_weight,
         )
+        x = self._apply_adapter(len(self.convs) - 1, x)
 
         return x,e
 

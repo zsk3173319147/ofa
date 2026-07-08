@@ -19,7 +19,7 @@ from lib_dataset.edge_loaders import (
 from lib_dataset.hg_loaders import generate_hg_loaders, generate_split_hypergraphs
 from lib_models.HNN.preprocessing import algo_preprocessing
 from lib_utils.baseline_readout import EdgePredictor, HyperGPredictor, MaxAggregator, MaxminAggregator, MeanAggregator
-from lib_utils.few_shot import apply_few_shot_edge_split, apply_few_shot_node_split
+from lib_utils.few_shot import apply_few_shot_edge_split, apply_few_shot_hg_split, apply_few_shot_node_split
 from lib_utils.metrics import (
     accuracy,
     aggr_metrics,
@@ -264,6 +264,7 @@ class BaselineExpAgent:
         for seed in range(self.args.num_seeds):
             fix_seed(seed)
             train_set, val_set, test_set = generate_split_hypergraphs(data, self.args.train_prop, self.args.valid_prop, seed)
+            train_set = apply_few_shot_hg_split(train_set, self.args, seed)
             batch_loaders = generate_hg_loaders(train_set, val_set, test_set, self.args)
 
             self.args.embedding_mode = True

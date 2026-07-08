@@ -92,13 +92,10 @@ class SubgraphDownstreamModel(nn.Module):
         self.encoder = encoder
         self.task_type = TaskType(task_type)
         self.readout = SubgraphReadout(args)
-        if bool(getattr(args, "use_message_prompt", False)):
+        if bool(getattr(args, "use_adapter", False)):
             if encoder.__class__.__name__ != "HGNN":
-                raise ValueError("Message prompt currently supports method=HGNN only.")
-            encoder.enable_message_prompt(
-                int(getattr(args, "message_prompt_rank", 4)),
-                condition_mode=str(getattr(args, "message_prompt_condition", "task_direction")),
-            )
+                raise ValueError("Adapter currently supports method=HGNN only.")
+            encoder.enable_adapter(int(getattr(args, "adapter_hidden_dim", 16)))
         self.head = self._build_head(num_targets, args)
 
     def _build_head(self, num_targets: int, args) -> nn.Module:
@@ -125,3 +122,54 @@ class SubgraphDownstreamModel(nn.Module):
         if batch.task_type == TaskType.EDGE_PRED:
             return out.view(-1)
         return out
+
+
+class MultiTaskSubgraphModel(nn.Module):
+    """Shared subgraph encoder with one lightweight head per task/dataset key."""
+
+    def __init__(self, encoder: nn.Module, head_dims: dict[TaskType | str, int], args):
+        super().__init__()
+        self.encoder = encoder
+        self.readout = SubgraphReadout(args)
+        if bool(getattr(args, "use_adapter", False)):
+            if encoder.__class__.__name__ != "HGNN":
+                raise ValueError("Adapter currently supports method=HGNN only.")
+            encoder.enable_adapter(int(getattr(args, "adapter_hidden_dim", 16)))
+        self.heads = nn.ModuleDict(
+            {str(head_key): nn.Linear(args.embedding_hidden, int(out_dim)) for head_key, out_dim in head_dims.items()}
+        )
+
+    @staticmethod
+    def _head_key(batch, task_type: TaskType) -> str:
+        metadata = getattr(batch, "metadata", {}) or {}
+        head_key = metadata.get("head_key")
+        if head_key is not None:
+            return str(head_key)
+        return task_type.value
+
+    def reset_parameters(self) -> None:
+        if hasattr(self.encoder, "reset_parameters"):
+            self.encoder.reset_parameters()
+        self.readout.reset_parameters()
+        for head in self.heads.values():
+            if hasattr(head, "reset_parameters"):
+                head.reset_parameters()
+
+    def encode(self, data: Any, task_type: TaskType | str) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        reset_dynamic_encoder_state(self.encoder)
+        if hasattr(self.encoder, "set_task_type"):
+            self.encoder.set_task_type(task_type)
+        return split_encoder_output(self.encoder(data))
+
+    def forward(self, batch) -> torch.Tensor:
+        task_type = TaskType(batch.task_type)
+        h_prime = batch.h_prime
+        node_emb, _ = self.encode(h_prime, task_type)
+        h_query = self.readout.query_pool(node_emb, h_prime)
+        head_key = self._head_key(batch, task_type)
+        if head_key not in self.heads:
+            head_key = task_type.value
+        logits = self.heads[head_key](h_query)
+        if task_type == TaskType.EDGE_PRED:
+            return logits.view(-1)
+        return logits

@@ -114,7 +114,7 @@ def parameter_parser():
                                                             "stream_player","twitter_friend"])
     
     parser.add_argument('--task_type',default='edge_pred',choices=['node_cls','edge_pred','hg_cls'])
-    parser.add_argument('--pipeline', default='subgraph', choices=['baseline', 'subgraph'])
+    parser.add_argument('--pipeline', default='subgraph', choices=['baseline', 'subgraph', 'multitask'])
     parser.add_argument('--is_default',default=False)
     parser.add_argument('--use_processed', default=True)
     parser.add_argument(
@@ -146,27 +146,22 @@ def parameter_parser():
     parser.add_argument('--subgraph_batch_size', default=256, type=int)
     parser.add_argument('--subgraph_cache', default=True, type=str2bool)
     parser.add_argument('--subgraph_add_role_features', default=False, type=str2bool)
-    parser.add_argument('--subgraph_role_dim', default=0, type=int)
     parser.add_argument('--subgraph_use_best_model', default=False, type=str2bool)
 
-    parser.add_argument('--pretrain_save_dir', default='./pretrained', type=str)
-    parser.add_argument('--tricl_save_path', default='', type=str)
-    parser.add_argument('--tricl_batch_size', default=128, type=int)
-    parser.add_argument('--tricl_steps_per_epoch', default=100, type=int)
-    parser.add_argument('--tricl_drop_feature_rate', default=0.2, type=float)
-    parser.add_argument('--tricl_drop_incidence_rate', default=0.2, type=float)
-    parser.add_argument('--tricl_edge_split_seed', default=-1, type=int)
-    parser.add_argument('--pretrain_path', default='', type=str)
+    parser.add_argument('--downstream_save_path', default='', type=str)
 
 
-    parser.add_argument('--freeze_encoder', default=False, type=str2bool)
-    parser.add_argument('--use_message_prompt', default=False, type=str2bool)
-    parser.add_argument('--message_prompt_rank', default=4, type=int)
-    parser.add_argument('--message_prompt_condition', default='task_direction', choices=['task_direction', 'direction', 'none'])
-    parser.add_argument('--message_prompt_lr', default=0.001, type=float)
-    parser.add_argument('--message_prompt_wd', default=0.0, type=float)
+    parser.add_argument('--use_adapter', default=False, type=str2bool)
+    parser.add_argument('--adapter_hidden_dim', default=16, type=int)
     parser.add_argument('--few_shot_k', default=50, type=int)
     parser.add_argument('--few_shot_scope', default='total', choices=['total', 'per_class'])
+    parser.add_argument('--task_names', default='', type=str)
+    parser.add_argument('--multitask_specs', default='', type=str)
+    parser.add_argument('--feature_align_dim', default=100, type=int)
+    parser.add_argument('--max_train_steps', default=0, type=int)
+    parser.add_argument('--task_max_steps', default='', type=str)
+    parser.add_argument('--d_multiple', default='', type=str)
+    parser.add_argument('--d_min_ratio', default='', type=str)
     
     parser.add_argument('--embedding_mode',default=True,type=bool) 
     parser.add_argument('--embedding_hidden',default=128,type=int) 
@@ -188,22 +183,9 @@ def parameter_parser():
     
     parser.add_argument('--hg_batch_size',default=256,type=int) # batch_size
     parser.add_argument('--pooling',default='mean')
-    parser.add_argument('--g_embed_hidden',default=128) 
-    parser.add_argument('--g_embed_layer',default=2) 
-    parser.add_argument('--g_embed_dropout',default=0.2) 
-    parser.add_argument('--g_embed_norm',default='ln') 
-    parser.add_argument('--use_weighted_loss',default=False)
     parser.add_argument('--early_stop',default=True) 
 
-    parser.add_argument('--is_perturbed',default=False) 
-    parser.add_argument('--is_poison',default=True) 
-    parser.add_argument('--pert_mode',default='spar_label',choices=['spar_feat','noise_feat',
-                                                                    'drop_incidence','add_incidence',
-                                                                    'spar_label','flip_label'])
-    parser.add_argument('--pert_p',default=0.0) 
 
-    # Choose std for synthetic feature noise
-    parser.add_argument('--feature_noise', default='0.6', type=str)
 
     parser.set_defaults(add_self_loop=False)
     parser.set_defaults(exclude_self=False)

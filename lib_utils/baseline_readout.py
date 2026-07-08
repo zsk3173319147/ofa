@@ -42,11 +42,11 @@ class HyperGPredictor(nn.Module):
         self.pooling = args.pooling
         self.classifier = MLP(
             in_channels=args.embedding_hidden,
-            hidden_channels=args.g_embed_hidden,
+            hidden_channels=128,
             out_channels=num_targets,
-            num_layers=args.g_embed_layer,
-            dropout=args.g_embed_dropout,
-            Normalization=args.g_embed_norm,
+            num_layers=2,
+            dropout=0.2,
+            Normalization="ln",
             InputNorm=False,
         )
 

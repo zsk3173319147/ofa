@@ -38,7 +38,11 @@ def fix_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = False
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = False
 
 # ------------ hypergraph add_self_loop ----------------------------------
 
@@ -151,4 +155,3 @@ def hyperedge_index_masking(hyperedge_index, num_nodes, num_edges, node_mask, ed
     elif node_mask is not None and edge_mask is None:
         masked_hyperedge_index = H[node_mask].to_sparse().indices()
     return masked_hyperedge_index
-

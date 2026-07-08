@@ -17,10 +17,10 @@ def is_subgraph_mode(args: Any) -> bool:
     return getattr(args, "subgraph_mode", "full") != "full"
 
 
-def subgraph_role_dim(args: Any) -> int:
+def _role_feature_dim(args: Any) -> int:
     if not bool(getattr(args, "subgraph_add_role_features", True)):
         return 0
-    return int(getattr(args, "subgraph_role_dim", SUBGRAPH_ROLE_DIM))
+    return SUBGRAPH_ROLE_DIM
 
 
 def _get_hyperedge_index(data: Any) -> torch.Tensor:
@@ -42,7 +42,7 @@ def _get_x(data: Any) -> torch.Tensor:
 
 
 def model_data_with_subgraph_schema(data: Any, args: Any) -> Any:
-    role_dim = subgraph_role_dim(args)
+    role_dim = _role_feature_dim(args)
     if role_dim <= 0:
         return data
 
@@ -69,7 +69,7 @@ def append_subgraph_role_features(
     task_type: TaskType | str,
     args: Any,
 ) -> torch.Tensor:
-    role_dim = subgraph_role_dim(args)
+    role_dim = _role_feature_dim(args)
     if role_dim <= 0:
         return x
 
@@ -87,7 +87,7 @@ def append_graph_batch_role_features(batch: Any, task_type: TaskType | str, args
     if TaskType(task_type) == TaskType.HG_CLS:
         query_mask.fill_(True)
     batch.query_mask = query_mask
-    if subgraph_role_dim(args) <= 0:
+    if _role_feature_dim(args) <= 0:
         return batch
     batch.x = append_subgraph_role_features(batch.x, query_mask, task_type, args)
     return batch

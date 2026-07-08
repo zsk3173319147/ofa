@@ -79,7 +79,11 @@ def _sample_sequence(values, count: int, seed: int):
 
 
 def apply_few_shot_edge_split(data_dict: dict, args: Any, seed: int) -> dict:
-    """Restrict edge-prediction train positives/negatives while preserving val/test."""
+    """Restrict edge-prediction train positives/negatives while preserving val/test.
+
+    For edge prediction, ``few_shot_k`` means k positive hyperedges. Negative
+    candidates are paired supervision rather than counted as additional shots.
+    """
     k = int(getattr(args, "few_shot_k", 0) or 0)
     if k <= 0:
         return data_dict
@@ -100,3 +104,40 @@ def apply_few_shot_edge_split(data_dict: dict, args: Any, seed: int) -> dict:
     neg_count = len(few.get("train_sns", []))
     print(f"Few-shot edge train samples: pos={pos_count}, neg_per_type={neg_count}, k={k}")
     return few
+
+def apply_few_shot_hg_split(train_set, args: Any, seed: int):
+    """Restrict hypergraph-classification training graphs while keeping val/test unchanged."""
+    k = int(getattr(args, "few_shot_k", 0) or 0)
+    if k <= 0:
+        return train_set
+
+    size = len(train_set)
+    if size == 0:
+        return train_set
+
+    scope = str(getattr(args, "few_shot_scope", "total"))
+    generator = torch.Generator().manual_seed(49979687 + int(seed))
+
+    labels = []
+    for idx in range(size):
+        y = train_set[idx].y
+        labels.append(int(y.view(-1)[0].item()))
+    labels = torch.tensor(labels, dtype=torch.long)
+
+    if scope == "per_class":
+        selected = []
+        for cls in torch.unique(labels, sorted=True).tolist():
+            cls_ids = (labels == int(cls)).nonzero(as_tuple=False).view(-1)
+            selected.append(_sample_indices(cls_ids, k, generator))
+        selected_ids = torch.cat(selected, dim=0) if selected else torch.empty(0, dtype=torch.long)
+    else:
+        all_ids = torch.arange(size, dtype=torch.long)
+        selected_ids = _sample_indices(all_ids, k, generator)
+
+    if selected_ids.numel() > 0:
+        selected_ids = selected_ids[torch.randperm(selected_ids.numel(), generator=generator)]
+
+    indices = [int(idx) for idx in selected_ids.tolist()]
+    print(f"Few-shot hg train samples: {len(indices)} ({scope}, k={k})")
+    return torch.utils.data.Subset(train_set, indices)
+

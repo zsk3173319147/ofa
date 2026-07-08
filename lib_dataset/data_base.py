@@ -155,12 +155,7 @@ class HyperDataset(object):
             else:
                 p2raw = path
             
-            f_noise = self.args.feature_noise
-            if (f_noise is not None) and dname in ['walmart-trips-100','house-committees-100','walmart-trips', 'house-committees']:
-                dataset = dataset_Hypergraph(name=dname,root = '../data/pyg_data/hypergraph_dataset_updated/',p2raw = p2raw,
-                                            feature_noise=f_noise)
-            else:
-                dataset = dataset_Hypergraph(name=dname,root = '../data/pyg_data/hypergraph_dataset_updated/',p2raw = p2raw)
+            dataset = dataset_Hypergraph(name=dname,root = '../data/pyg_data/hypergraph_dataset_updated/',p2raw = p2raw)
                 
         elif dname in self.fair_list:
             

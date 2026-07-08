@@ -8,6 +8,13 @@ def _edge_set(hyperedges):
     return {frozenset(edge) for edge in hyperedges}
 
 
+def get_union(hyperedges):
+    nodes = []
+    for edge in hyperedges:
+        nodes += list(edge)
+    return set(nodes)
+
+
 def _sample_filtered_negatives(sampler, positive_hyperedges, pred_num, forbidden_hyperedges):
     positive_hyperedges = _edge_set(positive_hyperedges)
     forbidden_hyperedges = _edge_set(forbidden_hyperedges)
